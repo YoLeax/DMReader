@@ -4,14 +4,16 @@ import { Activity, ArrowDownToLine, ArrowRight, AudioLines, Check, CheckCircle2,
 import type { Settings, Voice, Viewer, LogEntry } from '../server/types';
 import type { Design, Job } from '../server/engine';
 import { eventTypes, eventLabels, eventDescriptions, interactionLabels, interactionExamples, type EventType, type InteractionAction } from '../shared/events';
+import { resumeAudio } from './audio';
 import './styles.css';
 
 type Status = { settings: Settings; bridgeConnections: number; playerActive: boolean; lastEventAt: string | null; queue: Job[]; pending: number; totalViewers: number; todaySpeech: number; todayChars: number; used: number; cloneUsed: number; pendingDesigns: number; configured: boolean };
 type Page = 'overview' | 'events' | 'voices' | 'viewers' | 'designs' | 'logs' | 'settings';
 let adminToken = '';
+class RequestError extends Error { constructor(message: string, public status: number) { super(message); } }
 async function request(path: string, body?: unknown, method = body === undefined ? 'GET' : 'POST', signal?: AbortSignal) {
   const response = await fetch(`/api${path}`, { method, headers: { 'Content-Type': 'application/json', 'X-DMReader-Admin': adminToken }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal });
-  if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(error.error || `请求失败 (${response.status})`); }
+  if (!response.ok) { const error = await response.json().catch(() => ({})); throw new RequestError(error.error || `请求失败 (${response.status})`, response.status); }
   return response;
 }
 async function api<T = Record<string, unknown>>(path: string, body?: unknown, method?: string): Promise<T> { return (await request(path, body, method)).json(); }
@@ -35,11 +37,16 @@ function App() {
   const [status, setStatus] = useState<Status | null>(null), [page, setPage] = useState<Page>('overview');
   const [voices, setVoices] = useState<Voice[]>([]), [logs, setLogs] = useState<LogEntry[]>([]);
   const [toast, setToast] = useState(''), [fatal, setFatal] = useState(''), [busy, setBusy] = useState('');
-  const [playing, setPlaying] = useState(false), [now, setNow] = useState<{ username: string; text: string; voice: string } | null>(null);
+  const [playerState, setPlayerState] = useState<'waiting' | 'starting' | 'blocked' | 'playing' | 'other' | 'stopped' | 'error'>('waiting');
+  const playing = playerState === 'playing';
+  const [now, setNow] = useState<{ username: string; text: string; voice: string } | null>(null);
   const [volume, setVolume] = useState(Number(localStorage.getItem('dmreader-volume') ?? 80));
   const [help, setHelp] = useState(false);
-  const playerSession = useRef(crypto.randomUUID()), running = useRef(false), aborter = useRef<AbortController | null>(null);
-  const playbackRun = useRef(0), starting = useRef(false);
+  const playerSession = useRef(''), running = useRef(false), aborter = useRef<AbortController | null>(null);
+  const playbackRun = useRef(0), starting = useRef(false), manuallyStopped = useRef(false), previewing = useRef(false);
+  const canPlay = !!status && status.settings.enabled && status.settings.mode === 'bridge' && status.configured;
+  const canPlayRef = useRef(canPlay); canPlayRef.current = canPlay;
+  const gestureStart = useRef(() => {});
   const audio = useRef<AudioContext | null>(null), gain = useRef<GainNode | null>(null), source = useRef<AudioBufferSourceNode | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const notify = useCallback((message: string) => { setToast(message); if (toastTimer.current) clearTimeout(toastTimer.current); toastTimer.current = setTimeout(() => setToast(''), 6000); }, []);
@@ -52,18 +59,43 @@ function App() {
       setVoices(await api<Voice[]>('/voices')); await refresh();
     }).catch(e => setFatal(e.message));
     const poll = setInterval(() => { if (adminToken) void refresh().catch(e => setFatal(e.message)); }, 3000);
-    return () => { disposed = true; clearInterval(poll); running.current = false; aborter.current?.abort(); source.current?.stop(); };
+    const unload = () => {
+      stop(false, true);
+    };
+    window.addEventListener('pagehide', unload);
+    return () => { disposed = true; clearInterval(poll); window.removeEventListener('pagehide', unload); unload(); void audio.current?.close(); };
   }, []);
   useEffect(() => { if (gain.current) gain.current.gain.value = volume / 100; localStorage.setItem('dmreader-volume', String(volume)); }, [volume]);
   useEffect(() => {
     if (!playing) return;
-    const heartbeat = setInterval(() => { void api('/player/heartbeat', { session: playerSession.current }).catch(e => { stop(); notify(e.message); }); }, 5000);
+    const run = playbackRun.current, session = playerSession.current;
+    const heartbeat = setInterval(() => { if (running.current && run === playbackRun.current) void api('/player/heartbeat', { session }).catch(e => { if (run === playbackRun.current) { stop(false); setPlayerState('error'); notify(e.message); } }); }, 5000);
     return () => clearInterval(heartbeat);
   }, [playing]);
-  useEffect(() => { if (playing && status && (!status.settings.enabled || status.settings.mode !== 'bridge')) stop(); }, [status?.settings.enabled, status?.settings.mode]);
+  useEffect(() => {
+    if (!canPlay) { if (running.current || starting.current) stop(false); return; }
+    if (!fatal && !busy) void start();
+  }, [status, fatal, busy]);
+  gestureStart.current = () => {
+    if (!canPlayRef.current || manuallyStopped.current || previewing.current || running.current) return;
+    // Call resume in the gesture itself, even if an earlier automatic attempt is pending.
+    if (starting.current) { void audio.current?.resume().catch(() => {}); return; }
+    if (status?.playerActive) void unlockAudio().catch(() => {});
+    void start(false, true);
+  };
+  useEffect(() => {
+    const activate = (event: Event) => { if (event.isTrusted) gestureStart.current(); };
+    window.addEventListener('click', activate);
+    window.addEventListener('keydown', activate);
+    window.addEventListener('touchend', activate);
+    return () => { window.removeEventListener('click', activate); window.removeEventListener('keydown', activate); window.removeEventListener('touchend', activate); };
+  }, []);
   async function unlockAudio() {
-    if (!audio.current || audio.current.state === 'closed') { audio.current = new AudioContext(); gain.current = audio.current.createGain(); gain.current.gain.value = volume / 100; gain.current.connect(audio.current.destination); }
-    await audio.current.resume();
+    if (!audio.current || audio.current.state === 'closed') {
+      audio.current = new AudioContext(); gain.current = audio.current.createGain(); gain.current.gain.value = volume / 100; gain.current.connect(audio.current.destination);
+      audio.current.onstatechange = () => { if (running.current && audio.current?.state !== 'running') { stop(false); setPlayerState('blocked'); } };
+    }
+    return resumeAudio(audio.current);
   }
   async function playBuffer(data: ArrayBuffer, run?: number) {
     const decoded = await audio.current!.decodeAudioData(data);
@@ -72,26 +104,44 @@ function App() {
     await new Promise<void>(resolve => { node.onended = () => resolve(); node.start(); });
     if (source.current === node) source.current = null;
   }
-  function stop() {
-    playbackRun.current++; running.current = false; setPlaying(false); aborter.current?.abort(); source.current?.stop(); source.current = null; setNow(null);
-    void api('/player/release', { session: playerSession.current }).catch(() => {});
+  function stop(manual = true, keepalive = false) {
+    if (manual) manuallyStopped.current = true;
+    playbackRun.current++; running.current = false; setPlayerState(manuallyStopped.current ? 'stopped' : 'waiting'); aborter.current?.abort(); source.current?.stop(); source.current = null; setNow(null);
+    const session = playerSession.current; playerSession.current = '';
+    if (session) void fetch('/api/player/release', { method: 'POST', keepalive, headers: { 'Content-Type': 'application/json', 'X-DMReader-Admin': adminToken }, body: JSON.stringify({ session }) }).catch(() => {});
   }
-  async function start() {
-    if (running.current || starting.current) return;
+  async function start(manual = false, gesture = false) {
+    if (manual) manuallyStopped.current = false;
+    if (!canPlayRef.current || previewing.current || manuallyStopped.current || running.current || starting.current || (!manual && playerState === 'error')) return;
+    if (status?.playerActive) { setPlayerState('other'); return; }
+    if (!manual && !gesture && playerState === 'blocked' && audio.current?.state !== 'running') return;
     starting.current = true; const run = ++playbackRun.current;
+    setPlayerState('starting');
+    const session = crypto.randomUUID();
     try {
-      await unlockAudio(); await api('/player/claim', { session: playerSession.current });
-      running.current = true; setPlaying(true);
+      const ready = await unlockAudio();
+      if (run !== playbackRun.current || !canPlayRef.current || manuallyStopped.current) return;
+      if (!ready) { setPlayerState('blocked'); return; }
+      await api('/player/claim', { session });
+      if (run !== playbackRun.current || !canPlayRef.current || manuallyStopped.current) { await api('/player/release', { session }); return; }
+      playerSession.current = session; running.current = true; setPlayerState('playing');
       while (running.current && run === playbackRun.current) {
+        if (audio.current?.state !== 'running') { stop(false); setPlayerState('blocked'); break; }
         aborter.current = new AbortController();
-        const r = await request('/player/next', { session: playerSession.current }, 'POST', aborter.current.signal);
+        const r = await request('/player/next', { session }, 'POST', aborter.current.signal);
         if (!running.current || run !== playbackRun.current) break;
         if (r.status === 204) { await new Promise(r => setTimeout(r, 900)); continue; }
         const job = JSON.parse(decodeURIComponent(r.headers.get('X-DMReader-Job') || '{}'));
         const data = await r.arrayBuffer(); if (!running.current || run !== playbackRun.current) break;
         setNow(job); await playBuffer(data, run); if (run !== playbackRun.current) break; setNow(null); void refresh().catch(() => {});
       }
-    } catch (e) { if (run === playbackRun.current && (e as Error).name !== 'AbortError') { notify((e as Error).message); stop(); } }
+    } catch (e) {
+      if (run === playbackRun.current && (e as Error).name !== 'AbortError') {
+        stop(false);
+        if (e instanceof RequestError && e.status === 409) setPlayerState('other');
+        else { setPlayerState('error'); notify((e as Error).message); }
+      }
+    }
     finally { starting.current = false; }
   }
   async function action(name: string, fn: () => Promise<unknown>, message?: string) {
@@ -99,22 +149,27 @@ function App() {
   }
   async function preview(text: string, voice: string, style: string, speed: number) {
     if (playing) { notify('请先停止直播播放器，再进行试听。'); return; }
-    await action('preview', async () => { await unlockAudio(); const r = await request('/preview', { text, voice, style, speed }); setNow({ username: '音色试听', text, voice: voices.find(v => v.id === voice)?.name || voice }); try { await playBuffer(await r.arrayBuffer()); } finally { setNow(null); } });
+    previewing.current = true; stop();
+    try { await action('preview', async () => { if (!await unlockAudio()) throw new Error('浏览器尚未允许声音播放，请再次点击试听。'); const r = await request('/preview', { text, voice, style, speed }); setNow({ username: '音色试听', text, voice: voices.find(v => v.id === voice)?.name || voice }); try { await playBuffer(await r.arrayBuffer()); } finally { setNow(null); } }); }
+    finally { previewing.current = false; }
   }
   async function saveSettings(patch: Partial<Settings>) { return action('settings', () => api('/settings', patch, 'PATCH'), '设置已保存'); }
   async function reloadVoices() { setVoices(await api<Voice[]>('/voices')); }
   if (!status) return <div className="boot"><div className="brand-symbol"><AudioLines /></div><h1>DM Reader</h1><p>{fatal || '正在唤醒直播间的声音…'}</p>{fatal && <button onClick={() => location.reload()}>重新连接</button>}</div>;
   const s = status.settings, current = nav.find(n => n.id === page)!;
+  const playerTitle = playing ? '播放器就绪，等待下一条弹幕' : !canPlay ? !s.enabled ? '播报已暂停' : s.mode !== 'bridge' ? '当前由 LAPLACE 播放' : '等待配置语音服务' : ({ waiting: '正在准备自动播放', starting: '正在启动播放器', blocked: '点击页面任意位置，即可启用声音', other: '另一个后台页面正在播放', stopped: '本页面已手动停止播放', error: '播放器连接异常，请重试' } as const)[playerState];
+  const playerDetail = playing ? '保持此页面开启，弹幕将自动播报。' : playerState === 'blocked' ? '浏览器暂未允许自动播放；点击或按键后会自动开启，无需寻找开关。' : playerState === 'other' ? '此页面会等待播放权限释放，避免重复播报。' : playerState === 'stopped' ? '点击恢复播放即可继续；重新打开或刷新页面时默认自动开启。' : '页面打开后默认尝试开启播放器。';
   return <div className="app-shell">
     <aside className="sidebar"><a className="brand" href="/" aria-label="DM Reader 首页"><span className="brand-symbol"><AudioLines size={25} /></span><span>DM Reader<small>让弹幕，自带声场</small></span></a><div className="nav-label">WORKSPACE</div><nav>{nav.map(n => <button key={n.id} className={page === n.id ? 'nav active' : 'nav'} onClick={() => setPage(n.id)}><n.icon size={19} /><span>{n.title}</span>{n.id === 'designs' && status.pendingDesigns > 0 && <i>{status.pendingDesigns}</i>}{page === n.id && <span className="nav-dot" />}</button>)}</nav><div className="sidebar-bottom"><div className="local-note"><ShieldCheck size={17} /><span>本地运行 · 偏好留在本机</span></div><button className="help-button" onClick={() => setHelp(true)}><CircleHelp size={18} />使用指南<ChevronRight size={15} /></button><small className="version">DM Reader 0.1 · Doubao TTS 2.0</small></div></aside>
     <main><header className="topbar"><div className="breadcrumb">工作空间 <ChevronRight size={14} /> <b>{current.title}</b></div><div className="top-right"><Badge tone={status.bridgeConnections ? 'green' : ''}><span className={`dot ${status.bridgeConnections ? 'green-dot' : ''}`} />{status.bridgeConnections ? '弹幕桥已连接' : '等待弹幕连接'}</Badge><span className="room-label">房间 {s.roomId}</span><span className="avatar">Y</span></div></header>
     <div className="main-content"><div className="page-heading"><div><div className="eyebrow">{page === 'overview' ? 'YOUR LIVE, YOUR VOICE' : 'DM READER / STUDIO'}</div><h1>{current.title}<span className="heading-dot">.</span></h1><p>{current.sub}</p></div><button className="button secondary" onClick={() => setHelp(true)}><CircleHelp size={16} />使用指南</button></div>
       {fatal && <div role="alert" className="notice danger">连接中断：{fatal}<button onClick={() => location.reload()}>刷新后台</button></div>}
+      {canPlay && !playing && <div role="status" className="notice player-notice"><div className="notice-icon"><Volume2 size={20} /></div><div><b>{playerTitle}</b><p>{playerDetail}</p></div>{playerState !== 'other' && <button className="button secondary" disabled={playerState === 'starting' || busy === 'preview'} onClick={() => void start(true)}>{playerState === 'stopped' ? '恢复播放' : playerState === 'error' ? '重试播放' : '启用声音'}</button>}</div>}
       {!status.configured && <div className="notice"><div className="notice-icon"><Link2 size={20} /></div><div><b>还差一步，让声音上线</b><p>填入火山引擎 API Key，即可试听与播报。观众指令和偏好保存已经可用。</p></div><button className="text-button" onClick={() => setPage('settings')}>前往接入 <ArrowRight size={16} /></button></div>}
       {page === 'overview' && <>
         <div className="stats-grid"><Stat icon={MessageSquare} label="今日合成" value={fmt(status.todaySpeech)} unit="条" note="含缓存复用与试听" /><Stat icon={Users} label="记住的观众" value={fmt(status.totalViewers)} unit="位" note="按 UID 持久保存" /><Stat icon={AudioLines} label="等待播报" value={fmt(status.queue.length)} unit={`/ ${s.maxQueue}`} note={s.enabled ? '队列有序播放' : '播报已暂停'} /><Stat icon={ShieldCheck} label="本地可用字数" value={fmt(Math.max(0, s.budget - status.used))} unit="字" note="保护上限 · 非云端余额" /></div>
-        <div className="dashboard-grid"><section className="live-card"><div className="live-card-top"><Badge tone="glass"><span className={`dot ${playing ? 'green-dot' : ''}`} />{playing ? 'PLAYER ON' : 'READY WHEN YOU ARE'}</Badge><span>LIVE ROOM / {s.roomId}</span></div><div className="live-title"><h2>{playing ? '弹幕正在发声' : '给弹幕，开个麦。'}</h2><p>{s.mode === 'bridge' ? '每个人的声音，从这里被记住。' : '当前由 LAPLACE 自定义 API 负责播放。'}</p></div><div className={`wave ${playing && now ? 'animate' : ''}`}>{Array.from({ length: 39 }, (_, i) => <span key={i} style={{ height: `${13 + Math.sin(i * 1.2) ** 2 * (i > 10 && i < 29 ? 76 : 37)}px`, animationDelay: `${i * .04}s` }} />)}</div><div className="live-controls"><button className="button light" disabled={s.mode !== 'bridge' || !s.enabled || busy === 'preview'} onClick={() => playing ? stop() : void start()}>{playing ? <Square size={17} fill="currentColor" /> : <Play size={17} fill="currentColor" />}{playing ? '停止播放' : '开启播放器'}</button><span>{playing ? '保持此页面开启' : '点击后解锁浏览器音频'}</span><button className="icon-button light-icon" title="暂停或恢复服务" onClick={() => void saveSettings({ enabled: !s.enabled })}>{s.enabled ? <Pause size={19} /> : <Play size={19} />}</button></div></section>
-        <section className="card connect-card"><div className="card-head"><h2>连接状态</h2><button className="icon-button" aria-label="打开接入设置" onClick={() => setPage('settings')}><SlidersHorizontal size={17} /></button></div><Connection ok={status.bridgeConnections > 0} title="LAPLACE 弹幕桥" detail={status.bridgeConnections ? `${status.bridgeConnections} 个事件源已接入` : '等待 Event Bridge 连接'} /><Connection ok={status.configured} title="豆包语音 2.0" detail={status.configured ? '凭据已保存 · 可开始试听' : '尚未配置 API 凭据'} /><Connection ok={playing} title="本地播放器" detail={playing ? '此页面正在接收播放任务' : status.playerActive ? '另一个后台页面正在播放' : '点击开启播放器以开始接收'} /><div className="connect-foot"><LockKeyhole size={14} />服务仅监听本机 127.0.0.1</div></section></div>
+        <div className="dashboard-grid"><section className="live-card"><div className="live-card-top"><Badge tone="glass"><span className={`dot ${playing ? 'green-dot' : ''}`} />{playing ? 'PLAYER ON' : 'AUTO PLAY'}</Badge><span>LIVE ROOM / {s.roomId}</span></div><div className="live-title"><h2>{playing ? '弹幕正在发声' : '给弹幕，开个麦。'}</h2><p>{s.mode === 'bridge' ? '每个人的声音，从这里被记住。' : '当前由 LAPLACE 自定义 API 负责播放。'}</p></div><div className={`wave ${playing && now ? 'animate' : ''}`}>{Array.from({ length: 39 }, (_, i) => <span key={i} style={{ height: `${13 + Math.sin(i * 1.2) ** 2 * (i > 10 && i < 29 ? 76 : 37)}px`, animationDelay: `${i * .04}s` }} />)}</div><div className="live-controls"><button className="button light" disabled={!canPlay || playerState === 'starting' || busy === 'preview'} onClick={() => playing ? stop() : void start(true)}>{playing ? <Square size={17} fill="currentColor" /> : <Play size={17} fill="currentColor" />}{playing ? '停止播放' : playerState === 'stopped' ? '恢复播放' : '启用声音'}</button><span>{playing ? '默认自动播放 · 保持页面开启' : playerTitle}</span><button className="icon-button light-icon" title="暂停或恢复服务" onClick={() => void saveSettings({ enabled: !s.enabled })}>{s.enabled ? <Pause size={19} /> : <Play size={19} />}</button></div></section>
+        <section className="card connect-card"><div className="card-head"><h2>连接状态</h2><button className="icon-button" aria-label="打开接入设置" onClick={() => setPage('settings')}><SlidersHorizontal size={17} /></button></div><Connection ok={status.bridgeConnections > 0} title="LAPLACE 弹幕桥" detail={status.bridgeConnections ? `${status.bridgeConnections} 个事件源已接入` : '等待 Event Bridge 连接'} /><Connection ok={status.configured} title="豆包语音 2.0" detail={status.configured ? '凭据已保存 · 可开始试听' : '尚未配置 API 凭据'} /><Connection ok={playing} title="本地播放器" detail={playing ? '默认自动播放 · 正在接收播放任务' : playerTitle} /><div className="connect-foot"><LockKeyhole size={14} />服务仅监听本机 127.0.0.1</div></section></div>
         <div className="dashboard-grid lower"><section className="card"><div className="card-head"><h2>弹幕动态 <Badge>{logs.length ? '最近记录' : '等待中'}</Badge></h2><button className="text-button" onClick={() => setPage('logs')}>查看全部 <ArrowRight size={15} /></button></div>{logs.length ? <LogList logs={logs.slice(0, 5)} compact /> : <Empty title="第一条有声弹幕，等你开启">连接 LAPLACE 后，互动指令和播报记录会出现在这里。</Empty>}</section><section className="card command-card"><div className="card-head"><h2>把选择权交给观众</h2><Sparkles size={19} /></div><p>发送弹幕即可设置，下次来依然记得。</p><div className="command-row"><code>#音色 小何</code><span>换个声音</span></div><div className="command-row"><code>#风格 开心俏皮地说</code><span>赋予性格</span></div><div className="command-row"><code>#语速 1.2</code><span>调整节奏</span></div><div className="command-row"><code>#定制 温柔的成年女声</code><span>申请专属</span></div><button className="text-button" onClick={() => setHelp(true)}>查看全部指令 <ArrowRight size={15} /></button></section></div>
       </>}
       {page === 'events' && <EventSettings settings={s} save={saveSettings} />}
@@ -125,7 +180,7 @@ function App() {
       {page === 'settings' && <SettingsPanel status={status} voices={voices} save={saveSettings} action={action} notify={notify} />}
       <footer className="page-footer"><span><span className="dot green-dot" /> 在你的电脑上运行</span><span>把普通的相遇，变成有声的记忆。</span></footer>
     </div>
-    <div className="player-bar"><span className={`player-glyph ${playing ? 'on' : ''}`}><AudioLines size={22} /></span><div className="player-info"><b>{now ? `${now.username} · ${now.voice}` : playing ? '播放器就绪，等待下一条弹幕' : '声音待命中'}</b><span>{now?.text || '选择自己的音色，让直播间更有趣一点。'}</span></div><div className="player-actions">{playing && <Badge tone="green">正在监听</Badge>}<button className="icon-button" aria-label={volume ? '静音播放器' : '取消静音播放器'} onClick={() => setVolume(volume ? 0 : 80)}>{volume ? <Volume2 size={18} /> : <VolumeX size={18} />}</button><input aria-label="播放器音量" type="range" min="0" max="100" value={volume} onChange={e => setVolume(+e.target.value)} /><span>{volume}%</span><button className="icon-button" aria-label="清空待播队列" onClick={() => void action('clear', () => api('/queue/clear', {}), '待播队列已清空')}><Trash2 size={17} /></button></div></div>
+    <div className="player-bar"><span className={`player-glyph ${playing ? 'on' : ''}`}><AudioLines size={22} /></span><div className="player-info"><b>{now ? `${now.username} · ${now.voice}` : playerTitle}</b><span>{now?.text || playerDetail}</span></div><div className="player-actions">{playing && <Badge tone="green">正在监听</Badge>}<button className="icon-button" aria-label={volume ? '静音播放器' : '取消静音播放器'} onClick={() => setVolume(volume ? 0 : 80)}>{volume ? <Volume2 size={18} /> : <VolumeX size={18} />}</button><input aria-label="播放器音量" type="range" min="0" max="100" value={volume} onChange={e => setVolume(+e.target.value)} /><span>{volume}%</span><button className="icon-button" aria-label="清空待播队列" onClick={() => void action('clear', () => api('/queue/clear', {}), '待播队列已清空')}><Trash2 size={17} /></button></div></div>
     </main>{toast && <div role="status" className="toast"><CheckCircle2 size={18} /><span>{toast}</span><button className="icon-button" aria-label="关闭提示" onClick={() => setToast('')}><X size={16} /></button></div>}
     {help && <Modal title="让直播间的每个人，都有自己的声音" close={() => setHelp(false)}><div className="guide"><p>推荐使用「精准互动模式」：LAPLACE 接收弹幕 → Event Bridge 传递 UID → DM Reader 记住偏好并播放。请保持本后台页面开启，并关闭 LAPLACE 自带的自动语音播报。</p><div className="help-table">{[['#音色 小何', '从音色实验室选择名字，也支持完整 voice ID。'], ['#风格 开心俏皮地说', '调整官方音色的表达方式；“#风格 清除”恢复默认。'], ['#语速 1.2', '0.5～2 倍，永久记住。'], ['#定制 温柔的成年女声', '提交新音色申请；主播在后台选择空槽位并生成。'], ['#查询 / #我的音色', '语音回报当前音色、语速和风格；查询播报至少冷却 10 秒。'], ['#音色列表 / #帮助', '结果显示在后台活动记录。'], ['#重置', '恢复直播间默认设置。']].map(([cmd, detail]) => <div key={cmd}><code>{cmd}</code><p>{detail}</p></div>)}</div><p>指令前缀支持 #、＃、!、！。修改指令默认冷却 10 秒。设置成功后播报确认文案，不直接读出原始指令。按稳定 UID 保存；缺少 UID 的普通弹幕会跳过，其他有效事件使用默认声音。相同内容可复用本地音频，避免重复扣量。</p><p>「风格」改变表达方式；「专属音色」会调用火山音色设计 API，占用声音复刻槽位和更新次数，并使用独立的复刻资源。它们与标准 TTS 字数包不同。</p><div className="links"><a href="https://laplace.live/chat/event-bridge" target="_blank" rel="noreferrer">LAPLACE 接入说明 ↗</a><a href="https://docs.volcengine.com/docs/DoubaoVoice/SoundDesignAPI?lang=zh" target="_blank" rel="noreferrer">火山音色设计文档 ↗</a></div></div></Modal>}
   </div>;
@@ -181,9 +236,9 @@ function SettingsPanel({ status, voices, save, action, notify }: { status: Statu
   useEffect(() => { void api<typeof connection>('/connection').then(setConnection).catch(e => notify(e.message)); }, []);
   const change = <K extends keyof Settings>(key: K, value: Settings[K]) => setDraft(d => ({ ...d, [key]: value }));
   async function copy(value: string) { try { await navigator.clipboard.writeText(value); notify('已复制'); } catch { notify('浏览器不允许复制，请手动选择文本。'); } }
-  return <div className="settings-layout"><div><section className="card settings-card"><div className="card-head"><h2><Link2 size={20} />连接 LAPLACE</h2><Badge tone="purple">本机接入</Badge></div><Field label="运行模式"><select value={draft.mode} onChange={e => change('mode', e.target.value as Settings['mode'])}><option value="bridge">精准互动模式 · Event Bridge + 本地播放器（推荐）</option><option value="api">兼容 API 模式 · LAPLACE 播放 / 无观众身份</option></select></Field><Field label="直播间房间号"><input inputMode="numeric" value={draft.roomId} onChange={e => change('roomId', e.target.value)} /></Field><div className="setup-steps"><p><b>1</b>在 LAPLACE 设置 → Event Bridge 中填写：</p><div className="config-grid"><div><small>主机</small><code>127.0.0.1</code></div><div><small>端口</small><code>{location.port === '5173' ? '23000' : location.port || '23000'}</code></div></div><Field label="密码 / 本地 API 密钥"><div className="copy-field"><input readOnly type="password" value={connection.apiToken} /><button className="icon-button" aria-label="复制本地 API 密钥" onClick={() => void copy(connection.apiToken)}><Copy size={17} /></button></div></Field><p><b>2</b>打开 Event Bridge 连接，并勾选自动重连。</p><p><b>3</b>精准互动模式下，关闭 LAPLACE「自动语音播报」，在本后台开启播放器。</p></div><details><summary>使用自定义 TTS API 的接入信息</summary><p>LAPLACE 默认只传 token、text、voice、instructions，不带 UID。兼容模式使用统一音色；精准模式此接口返回静音，避免双重播报。</p><div className="copy-field"><input readOnly value={`http://127.0.0.1:${location.port === '5173' ? '23000' : location.port || '23000'}/v1/tts`} /><button className="icon-button" aria-label="复制 API 地址" onClick={() => void copy(`http://127.0.0.1:${location.port === '5173' ? '23000' : location.port || '23000'}/v1/tts`)}><Copy size={17} /></button></div><p>API 密钥填上方本地密钥；音色填「小何」等名称，留空则跟随默认。指令框填说话风格。</p></details></section>
+  return <div className="settings-layout"><div><section className="card settings-card"><div className="card-head"><h2><Link2 size={20} />连接 LAPLACE</h2><Badge tone="purple">本机接入</Badge></div><Field label="运行模式"><select value={draft.mode} onChange={e => change('mode', e.target.value as Settings['mode'])}><option value="bridge">精准互动模式 · Event Bridge + 本地播放器（推荐）</option><option value="api">兼容 API 模式 · LAPLACE 播放 / 无观众身份</option></select></Field><Field label="直播间房间号"><input inputMode="numeric" value={draft.roomId} onChange={e => change('roomId', e.target.value)} /></Field><div className="setup-steps"><p><b>1</b>在 LAPLACE 设置 → Event Bridge 中填写：</p><div className="config-grid"><div><small>主机</small><code>127.0.0.1</code></div><div><small>端口</small><code>{location.port === '5173' ? '23000' : location.port || '23000'}</code></div></div><Field label="密码 / 本地 API 密钥"><div className="copy-field"><input readOnly type="password" value={connection.apiToken} /><button className="icon-button" aria-label="复制本地 API 密钥" onClick={() => void copy(connection.apiToken)}><Copy size={17} /></button></div></Field><p><b>2</b>打开 Event Bridge 连接，并勾选自动重连。</p><p><b>3</b>精准互动模式下，关闭 LAPLACE「自动语音播报」，本后台播放器会默认自动开启。若浏览器拦截声音，点击页面任意位置即可启用。</p></div><details><summary>使用自定义 TTS API 的接入信息</summary><p>LAPLACE 默认只传 token、text、voice、instructions，不带 UID。兼容模式使用统一音色；精准模式此接口返回静音，避免双重播报。</p><div className="copy-field"><input readOnly value={`http://127.0.0.1:${location.port === '5173' ? '23000' : location.port || '23000'}/v1/tts`} /><button className="icon-button" aria-label="复制 API 地址" onClick={() => void copy(`http://127.0.0.1:${location.port === '5173' ? '23000' : location.port || '23000'}/v1/tts`)}><Copy size={17} /></button></div><p>API 密钥填上方本地密钥；音色填「小何」等名称，留空则跟随默认。指令框填说话风格。</p></details></section>
       <section className="card settings-card"><div className="card-head"><h2><Mic2 size={20} />火山引擎凭据</h2><Badge tone={status.configured ? 'green' : ''}>{status.configured ? '已配置' : '待配置'}</Badge></div><p className="muted">凭据只发往本机服务，由服务调用火山官方接口；在本地加密保存，页面不会回显。</p><div className="filter-row"><button className={authMode === 'key' ? 'selected' : ''} onClick={() => setAuthMode('key')}>新版 API Key</button><button className={authMode === 'legacy' ? 'selected' : ''} onClick={() => setAuthMode('legacy')}>App ID + Access Token</button></div>{authMode === 'key' ? <Field label="火山语音服务 API Key"><input type="password" autoComplete="new-password" placeholder="填入你的 API Key" value={credentials.apiKey} onChange={e => setCredentials({ ...credentials, apiKey: e.target.value })} /></Field> : <><Field label="App ID"><input value={credentials.appId} onChange={e => setCredentials({ ...credentials, appId: e.target.value })} /></Field><Field label="Access Token"><input type="password" autoComplete="new-password" value={credentials.accessKey} onChange={e => setCredentials({ ...credentials, accessKey: e.target.value })} /></Field></>}<button className="button secondary" onClick={() => void action('credentials', async () => { await api('/credentials', authMode === 'key' ? { apiKey: credentials.apiKey } : { appId: credentials.appId, accessKey: credentials.accessKey }); setCredentials({ apiKey: '', appId: '', accessKey: '' }); }, '凭据已加密保存，可前往音色实验室试听')}>保存凭据</button>{connection.credentialSource === 'environment' && <p className="caption">当前环境变量优先于页面保存的凭据。</p>}</section>
       <section className="card settings-card"><div className="card-head"><h2><SlidersHorizontal size={20} />播报规则</h2></div><div className="form-grid"><Field label="默认音色"><select value={draft.defaultVoice} onChange={e => change('defaultVoice', e.target.value)}>{voices.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}</select></Field><Field label="默认语速"><select value={draft.speechRate} onChange={e => change('speechRate', +e.target.value)}>{[-50, -20, 0, 10, 20, 50, 100].map(v => <option key={v} value={v}>{1 + v / 100} 倍</option>)}</select></Field></div><Field label="默认说话风格"><textarea rows={2} maxLength={200} placeholder="例如：轻松自然，语气有活力" value={draft.defaultStyle} onChange={e => change('defaultStyle', e.target.value)} /></Field><div className="form-grid">{([['maxChars', '单条最多字数', 5, 500], ['maxQueue', '待播队列长度', 1, 50], ['cooldownSeconds', '指令冷却（秒）', 0, 300]] as const).map(([key, label, min, max]) => <Field key={key} label={label}><input type="number" min={min} max={max} value={draft[key]} onChange={e => change(key, +e.target.value)} /></Field>)}</div><Toggle value={draft.announceUsername} title="朗读观众昵称" onChange={v => change('announceUsername', v)} /><Toggle value={draft.allowStyles} title="允许 #风格 指令" onChange={v => change('allowStyles', v)} /><Toggle value={draft.allowDesignRequests} title="允许 #定制 申请" detail="只记录申请，生成仍由主播操作" onChange={v => change('allowDesignRequests', v)} /><Field label="屏蔽词" hint="每行一个，命中整词即跳过播报。"><textarea rows={3} value={draft.blockedWords} onChange={e => change('blockedWords', e.target.value)} /></Field><details><summary>自定义 API 的允许来源</summary><Field label="CORS 来源（每行一个）"><textarea value={draft.allowedOrigins.join('\n')} onChange={e => change('allowedOrigins', e.target.value.split('\n').filter(Boolean))} /></Field></details></section><div className="save-bar"><span>更改后记得保存</span><button className="button primary" onClick={() => void save({ ...draft, enabled: status.settings.enabled })}><Check size={17} />保存接入与播报设置</button></div></div>
-    <aside><section className="card settings-card quota-card"><div className="card-head"><h2><ShieldCheck size={19} />试用额度保护</h2></div><div className="quota-number">{fmt(status.used)}<small>/ {fmt(draft.budget)} 字</small></div><div className="progress"><span style={{ width: `${Math.min(100, status.used / Math.max(1, draft.budget) * 100)}%` }} /></div><p className="caption">本机合成统计 + 手动填入的历史用量，不是火山实时余额。达到上限后停止调用；超时请求按预估字数保守计入。</p><Field label="标准音色累计上限（字）"><input type="number" min="0" value={draft.budget} onChange={e => change('budget', +e.target.value)} /></Field><Field label="接入前已使用（字）"><input type="number" min="0" value={draft.usedBefore} onChange={e => change('usedBefore', +e.target.value)} /></Field><hr /><Field label="专属音色合成上限（字）" hint={`独立资源池 · 本机已用 ${fmt(status.cloneUsed)} 字。填 0 可禁止专属音色合成。`}><input type="number" min="0" value={draft.cloneBudget} onChange={e => change('cloneBudget', +e.target.value)} /></Field><p className="caption">音色设计的更新次数在火山槽位中计数，不包含在此字数统计。请在火山控制台核对试用范围与有效期。</p></section><section className="tip-card"><Sparkles size={21} /><h3>开播前的小检查</h3><p>连接弹幕桥 → 试听一句 → 关闭 LAPLACE 自动播报 → 开启本地播放器。</p><p>保持后台页面开启，并让 OBS 捕获浏览器的播放声音。</p></section></aside></div>;
+    <aside><section className="card settings-card quota-card"><div className="card-head"><h2><ShieldCheck size={19} />试用额度保护</h2></div><div className="quota-number">{fmt(status.used)}<small>/ {fmt(draft.budget)} 字</small></div><div className="progress"><span style={{ width: `${Math.min(100, status.used / Math.max(1, draft.budget) * 100)}%` }} /></div><p className="caption">本机合成统计 + 手动填入的历史用量，不是火山实时余额。达到上限后停止调用；超时请求按预估字数保守计入。</p><Field label="标准音色累计上限（字）"><input type="number" min="0" value={draft.budget} onChange={e => change('budget', +e.target.value)} /></Field><Field label="接入前已使用（字）"><input type="number" min="0" value={draft.usedBefore} onChange={e => change('usedBefore', +e.target.value)} /></Field><hr /><Field label="专属音色合成上限（字）" hint={`独立资源池 · 本机已用 ${fmt(status.cloneUsed)} 字。填 0 可禁止专属音色合成。`}><input type="number" min="0" value={draft.cloneBudget} onChange={e => change('cloneBudget', +e.target.value)} /></Field><p className="caption">音色设计的更新次数在火山槽位中计数，不包含在此字数统计。请在火山控制台核对试用范围与有效期。</p></section><section className="tip-card"><Sparkles size={21} /><h3>开播前的小检查</h3><p>连接弹幕桥 → 关闭 LAPLACE 自动播报 → 确认本地播放器正在监听。</p><p>保持后台页面开启，并让 OBS 捕获浏览器的播放声音。</p></section></aside></div>;
 }
 createRoot(document.getElementById('root')!).render(<App />);
