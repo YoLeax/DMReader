@@ -59,7 +59,13 @@ npm start
 
 ## 音色与文字设计
 
-内置 **93 个已核对的豆包 2.0 标准音色**，提供搜索、筛选、试听和默认音色设置。目录选自官方列表中明确支持指令遵循的标准音色；不是对整个火山目录或当前账户全部权限的承诺。
+内置 **445 个官方豆包 2.0 音色**（2026-10-01 对照官方主表 294 个与外语表 151 个，无重复 ID），包含 Lily。支持名称 / ID / 语种 / 场景搜索、语种筛选、试听和默认音色设置。名称与 ID 逐项取自官方资料，不根据名称拼接 ID。目录收录不等于当前账户逐项获得调用权限；未声明风格能力的音色以实际效果为准。
+
+「音色实验室 → 官方音色同步」使用火山公开 **ListSpeakers** 接口，版本 `2025-05-20`，分页传入 `ResourceIDs: ["seed-tts-2.0"]`。后台可立即同步，并默认开启每日自动同步（需本服务运行且凭据已配置）。此操作只查询目录，不调用合成、不扣本地 TTS 字数预算。无需定期人工检查文档。
+
+列表接口需要 **OpenAPI Access Key ID / Secret Access Key（AK / SK）**，与合成的 API Key 或 App ID + Access Token 不同。在此区域点击「配置同步凭据」，填入具有 `ListSpeakers` 查询权限的 AK / SK 后「保存并同步」。凭据独立加密保存在本机，不回显；也支持 `VOLCENGINE_ACCESS_KEY_ID` / `VOLCENGINE_SECRET_ACCESS_KEY` 环境变量。尚未配置时仍可使用完整的内置目录。AK / SK 可从 [火山 API 访问密钥](https://console.volcengine.com/iam/keymanage/) 页面新建；IAM 子账号需具备查询权限。
+
+自动同步在启动后及每分钟检查到期时间，成功后间隔 24 小时；失败至少间隔 1 小时再自动尝试。一次同步会完成全部分页并检查字段、总数与重复 ID，然后保存；超时、网络失败、权限错误或异常分页都保留已有目录。按 ID 合并，保留旧名称和之前的音色，避免上游改名或临时缺项影响已保存的观众偏好；同名冲突不猜测匹配。同步后立即用于指令解析，音色页自动刷新目录。
 
 **说话风格**通过 `req_params.additions` 中的 `context_texts` 设置。它调节已有声音的情绪、口音与表达，不能保证创造新的音色。
 
@@ -119,7 +125,7 @@ npm run build
 
 测试覆盖：UID 隔离、持久化、改名、指令解析与冷却、房间筛选、事件去重、播放器租约、屏蔽与静音、缓存、并发预算、失败计数、专属音色申请与槽位防复用、NDJSON/SSE 分片解析、CORS、Host/Origin 检查、API 身份验证、导入导出和真实 WebSocket 协议握手。
 
-主要文件：`server/app.ts`（HTTP / WebSocket）、`server/engine.ts`（业务规则）、`server/provider.ts`（火山调用）、`server/store.ts`（SQLite）、`server/voices.ts`（官方音色目录）、`src/main.tsx`（后台与播放器）。
+主要文件：`server/app.ts`（HTTP / WebSocket）、`server/engine.ts`（业务规则）、`server/provider.ts`（火山调用）、`server/store.ts`（SQLite）、`server/voice-catalog.json`（内置目录）、`server/voice-sync.ts`（OpenAPI 签名 / 分页 / 持久同步）、`src/main.tsx`（后台与播放器）。
 
 2026-10-01 已在真实房间通过 LAPLACE 收到弹幕事件，确认 `origin=659719`，字段包括 `uid`、`username`、`message`、`id`、`timestampNormalized` 等。音色/风格指令保存后，普通弹幕以对应声音合成并在后台播放器完成播放。
 
@@ -129,4 +135,10 @@ npm run build
 - [LAPLACE Event Bridge](https://laplace.live/chat/event-bridge) / [官方实现](https://github.com/laplace-live/event-bridge)
 - [豆包 HTTP 单向流式语音合成](https://docs.volcengine.com/docs/DoubaoVoice/unidirectional-streaming-text-to-speech-http?lang=zh)
 - [豆包音色列表](https://docs.volcengine.com/docs/DoubaoVoice/Tonelist-1?lang=zh)
+- [ListSpeakers 官方音色列表 API](https://api.volcengine.com/api-docs/view?action=ListSpeakers&serviceCode=speech_saas_prod&version=2025-05-20)
+- [豆包语音 OpenAPI SDK 与 AK/SK 接入](https://api.volcengine.com/api-sdk?serviceCode=speech_saas_prod&version=2025-05-20)
 - [音色设计 API](https://docs.volcengine.com/docs/DoubaoVoice/SoundDesignAPI?lang=zh)
+
+### 2026-10-01 音色补全与同步验证
+
+48 项自动化测试通过，包含列表分页、字段校验、失败回退、持久化、每日更新 / 失败退避、密钥独立加密、UID 偏好与热更新。HMAC 请求签名与官方 `@volcengine/openapi@1.36.2` 相同输入的结果一致。真实合成接口已成功返回 Lily 与一个官方 `ICL_uranus` 预置音色的短句音频，分别计费 6 字，均走 `seed-tts-2.0`；没有调用专属音色设计。列表接口尚待用户配置 OpenAPI AK / SK 后验证真实同步；其余新增音色未逐一试听，不保证当前账户全部有权限。

@@ -1,5 +1,6 @@
 import { defaultEventSpeech, defaultInteractionActions, type EventType, type InteractionAction } from '../shared/events.js';
-export interface Voice { id: string; name: string; gender: string; tag: string; description: string; resource: 'seed-tts-2.0' | 'seed-icl-2.0'; }
+export interface Voice { id: string; name: string; gender: string; tag: string; description: string; language?: string; scenes?: string[]; aliases?: string[]; resource: 'seed-tts-2.0' | 'seed-icl-2.0'; }
+export interface OpenApiCredentials { accessKeyId: string; secretAccessKey: string; }
 export interface Settings {
   enabled: boolean; mode: 'bridge' | 'api'; roomId: string; defaultVoice: string;
   defaultStyle: string; speechRate: number; maxChars: number; maxQueue: number;

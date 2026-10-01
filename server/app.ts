@@ -10,6 +10,7 @@ import { Engine, identity, parseCommand } from './engine.js';
 import { DoubaoProvider, silentWav } from './provider.js';
 import { AppError, type Voice } from './types.js';
 import { eventTypes, type EventType, type InteractionAction } from '../shared/events.js';
+import { VoiceCatalogSync, type CatalogFetch } from './voice-sync.js';
 
 const localHost = /^(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i;
 const localOrigin = (value: string) => /^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(value);
@@ -29,11 +30,15 @@ const settingsPatch = z.object({
 }).partial().strict();
 const sessionSchema = z.object({ session: z.string().uuid() });
 
-export function createService(options: { dataDir: string; distDir?: string; provider?: Pick<DoubaoProvider, 'synthesize' | 'design'> }) {
+export function createService(options: { dataDir: string; distDir?: string; provider?: Pick<DoubaoProvider, 'synthesize' | 'design'>; catalogFetch?: CatalogFetch }) {
   const store = new Store(options.dataDir);
   const engine = new Engine(store, options.provider || new DoubaoProvider(() => store.credentials()));
+  const catalogSync = new VoiceCatalogSync(store, options.catalogFetch);
+  const syncTimer = setInterval(() => { void catalogSync.refreshIfDue().catch(() => {}); }, 60000);
+  syncTimer.unref();
   const app = express();
   const server = createServer(app);
+  server.once('listening', () => { void catalogSync.refreshIfDue().catch(() => {}); });
   const adminToken = randomBytes(32).toString('hex');
   app.disable('x-powered-by');
   app.use((req, res, next) => {
@@ -60,6 +65,16 @@ export function createService(options: { dataDir: string; distDir?: string; prov
   app.get('/api/bootstrap', (_req, res) => res.json({ adminToken, status: engine.status() }));
   app.get('/api/status', (_req, res) => res.json(engine.status()));
   app.get('/api/voices', (_req, res) => res.json(engine.voices()));
+  app.get('/api/voice-sync', (_req, res) => res.json(catalogSync.status()));
+  app.post('/api/voice-sync', async (_req, res) => { await catalogSync.sync(); res.json(catalogSync.status()); });
+  app.patch('/api/voice-sync', (req, res) => {
+    const { enabled } = z.object({ enabled: z.boolean() }).strict().parse(req.body);
+    store.set('voiceAutoSync', enabled); res.json(catalogSync.status());
+  });
+  app.post('/api/voice-sync/credentials', (req, res) => {
+    const c = z.object({ accessKeyId: z.string().trim().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/), secretAccessKey: z.string().trim().min(1).max(2000) }).strict().parse(req.body);
+    store.saveOpenApiCredentials(c); res.json(catalogSync.status());
+  });
   app.get('/api/logs', (_req, res) => res.json(store.logs(200)));
   app.get('/api/event', (req, res) => res.json(engine.recentEvent(typeof req.query.type === 'string' ? req.query.type : undefined)));
   app.get('/api/events', (_req, res) => res.json(engine.recentEvents()));
@@ -202,6 +217,7 @@ export function createService(options: { dataDir: string; distDir?: string; prov
     ws.on('close', () => { clearInterval(heartbeat); engine.bridgeConnections--; });
   });
   async function close() {
+    clearInterval(syncTimer); await catalogSync.close();
     for (const client of wss.clients) if (client.readyState !== WebSocket.CLOSED) client.terminate();
     await new Promise<void>(r => wss.close(() => r()));
     if (server.listening) await new Promise<void>(r => server.close(() => r()));

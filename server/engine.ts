@@ -5,7 +5,7 @@ import { eventSchema, identity, supportedEvent, inspectEvent, eventKey, eventTex
 import { type EventType, type InteractionAction } from '../shared/events.js';
 export { identity } from './events.js';
 import { authHeaders, type AudioResult, type Synthesis, DoubaoProvider } from './provider.js';
-import { voices } from './voices.js';
+import { mergedVoices } from './voice-sync.js';
 
 export interface Job { id: string; uid: string; username: string; text: string; created: number; eventType: EventType | 'command'; action?: InteractionAction; announceName: boolean; }
 interface IngestResult { ignored?: boolean; duplicate?: boolean; queued?: boolean; skipped?: string; command?: string; }
@@ -33,8 +33,13 @@ export class Engine {
   constructor(public store: Store, public provider: Pick<DoubaoProvider, 'synthesize' | 'design'>, private now = Date.now) {}
   recentEvent(type?: string) { return type && supportedEvent(type) ? this.latest.get(type) || null : this.lastEvent; }
   recentEvents() { return Object.fromEntries(this.latest); }
-  voices(): Voice[] { return [...voices, ...(this.store.get<Voice[]>('customVoices') || [])]; }
-  voice(id: string) { return this.voices().find(v => v.id === id || v.name.toLowerCase() === id.replace(/\s+2\.0$/, '').toLowerCase()); }
+  voices(): Voice[] { return [...mergedVoices(this.store), ...(this.store.get<Voice[]>('customVoices') || [])]; }
+  voice(id: string) {
+    const voices = this.voices(), exact = voices.find(v => v.id === id); if (exact) return exact;
+    const name = id.replace(/\s+2\.0$/, '').toLowerCase();
+    const matches = voices.filter(v => [v.name, ...(v.aliases || [])].some(n => n.toLowerCase() === name));
+    return matches.length === 1 ? matches[0] : undefined;
+  }
   playerActive() { return !!this.lease && this.lease.expires > Date.now(); }
   claimPlayer(id: string) {
     if (this.playerActive() && this.lease!.id !== id) throw new AppError('另一个页面正在播放。请先在那个页面停止播放，或等待 20 秒释放。', 409);

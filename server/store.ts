@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
-import { defaults, type Settings, type Viewer, type Credentials } from './types.js';
+import { defaults, type Settings, type Viewer, type Credentials, type OpenApiCredentials } from './types.js';
 
 export class Store {
   db: DatabaseSync;
@@ -36,21 +36,31 @@ export class Store {
     const saved = this.get<Partial<Settings>>('settings');
     return { ...defaults, ...saved, eventSpeech: { ...defaults.eventSpeech, ...saved?.eventSpeech }, interactionActions: { ...defaults.interactionActions, ...saved?.interactionActions } };
   }
-  credentials(): Credentials {
-    const encoded = this.get<string>('credentials');
-    let saved: Partial<Credentials> = {};
+  private readSecrets<T>(key: string): Partial<T> {
+    const encoded = this.get<string>(key);
+    let saved: Partial<T> = {};
     if (encoded) {
       const b = Buffer.from(encoded, 'base64');
       const c = createDecipheriv('aes-256-gcm', this.key, b.subarray(0, 12)); c.setAuthTag(b.subarray(12, 28));
       saved = JSON.parse(Buffer.concat([c.update(b.subarray(28)), c.final()]).toString());
     }
-    return { apiKey: process.env.DOUBAO_API_KEY || saved.apiKey || '', appId: process.env.DOUBAO_APP_ID || saved.appId || '', accessKey: process.env.DOUBAO_ACCESS_KEY || saved.accessKey || '' };
+    return saved;
   }
-  saveCredentials(value: Credentials) {
+  private saveSecrets(key: string, value: unknown) {
     const iv = randomBytes(12), c = createCipheriv('aes-256-gcm', this.key, iv);
     const encrypted = Buffer.concat([c.update(JSON.stringify(value)), c.final()]);
-    this.set('credentials', Buffer.concat([iv, c.getAuthTag(), encrypted]).toString('base64'));
+    this.set(key, Buffer.concat([iv, c.getAuthTag(), encrypted]).toString('base64'));
   }
+  credentials(): Credentials {
+    const saved = this.readSecrets<Credentials>('credentials');
+    return { apiKey: process.env.DOUBAO_API_KEY || saved.apiKey || '', appId: process.env.DOUBAO_APP_ID || saved.appId || '', accessKey: process.env.DOUBAO_ACCESS_KEY || saved.accessKey || '' };
+  }
+  saveCredentials(value: Credentials) { this.saveSecrets('credentials', value); }
+  openApiCredentials(): OpenApiCredentials {
+    const saved = this.readSecrets<OpenApiCredentials>('openApiCredentials');
+    return { accessKeyId: process.env.VOLCENGINE_ACCESS_KEY_ID || saved.accessKeyId || '', secretAccessKey: process.env.VOLCENGINE_SECRET_ACCESS_KEY || saved.secretAccessKey || '' };
+  }
+  saveOpenApiCredentials(value: OpenApiCredentials) { this.saveSecrets('openApiCredentials', value); }
   viewer(uid: string): Viewer | undefined {
     const row = this.db.prepare('SELECT * FROM viewers WHERE uid=?').get(uid) as unknown as Viewer | undefined;
     return row ? { ...row, muted: !!row.muted, locked: !!row.locked } : undefined;

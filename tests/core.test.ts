@@ -32,8 +32,30 @@ test('commands require an exact prefix and separate argument; UID rejects unstab
   assert.equal(identity('open_id-abc'), 'open_id-abc');
 });
 test('catalog contains unique real TTS 2.0 IDs and chat-friendly aliases', () => {
-  assert.equal(voices.length, 93); assert.equal(new Set(voices.map(v => v.id)).size, 93);
-  assert.ok(voices.every(v => v.id.endsWith('_uranus_bigtts')));
+  assert.equal(voices.length, 445); assert.equal(new Set(voices.map(v => v.id)).size, voices.length);
+  assert.equal(new Set(voices.map(v => v.name.toLowerCase())).size, voices.length);
+  assert.ok(voices.every(v => v.resource === 'seed-tts-2.0' && v.language && !v.id.startsWith('S_')));
+  assert.equal(voices.find(v => v.name === 'Lily')?.id, 'ja_female_bv523_uranus_bigtts');
+  assert.equal(voices.find(v => v.name === '小何')?.id, 'zh_female_xiaohe_uranus_bigtts');
+  // The official foreign table contains nontrivial IDs; do not build them from a name.
+  assert.equal(voices.find(v => v.name === 'Rowan')?.id, 'en_male_adam-imitation_uranus_bigtts');
+});
+
+test('foreign and official preset names resolve without changing resource or viewer isolation', async () => {
+  const f = fixture();
+  try {
+    for (const [i, name] of ['lily', 'LILY 2.0', 'Lily', 'Rowan', 'Charlie'].entries()) {
+      const viewer = f.store.touch(`foreign-${i}`, '音色测试');
+      f.engine.command(viewer, `#音色 ${name}`);
+      const voice = f.engine.voice(name)!;
+      assert.equal(f.store.viewer(viewer.uid)?.voice, voice.id);
+      await f.engine.speak(`声音测试${i}`, { uid: viewer.uid, source: 'preview' });
+      assert.equal(f.calls.at(-1)?.voice.id, voice.id);
+      assert.equal(f.calls.at(-1)?.voice.resource, 'seed-tts-2.0');
+    }
+    assert.equal(f.store.spent('seed-icl-2.0'), 0);
+    assert.equal(f.store.viewer('foreign-0')?.voice, 'ja_female_bv523_uranus_bigtts');
+  } finally { f.close(); }
 });
 test('same-name viewers are isolated; settings survive restart and rename', () => {
   const f = fixture();
