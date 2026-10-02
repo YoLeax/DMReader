@@ -18,6 +18,8 @@ npm start
 
 后台：<http://127.0.0.1:23000>。服务仅监听 `127.0.0.1`。播放器默认自动开启；若浏览器拦截有声自动播放，页面会提示，点击页面任意位置或按键即可启用。开发时 `npm run dev`，页面在 <http://127.0.0.1:5173>。
 
+所有管理页面均有固定 hash 地址：`#overview`、`#analytics`、`#events`、`#voices`、`#viewers`、`#designs`、`#logs`、`#settings`。刷新、直接打开链接及浏览器前进 / 后退均保留对应页面；空地址或无效 hash 自动归到 `#overview`。页面切换不会重新挂载全局播放器。
+
 ## 首次接入
 
 1. 后台「接入与设置 → 火山引擎凭据」保存语音服务 **API Key**。也支持 App ID + Access Token。不是火山账号的通用 AK/SK。

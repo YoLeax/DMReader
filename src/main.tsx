@@ -8,9 +8,9 @@ import { resumeAudio } from './audio';
 import './styles.css';
 import { VoiceSyncPanel } from './VoiceSyncPanel';
 import { AnalyticsDashboard } from './AnalyticsDashboard';
+import { useHashPage, type Page } from './navigation';
 
 type Status = { settings: Settings; bridgeConnections: number; playerActive: boolean; lastEventAt: string | null; queue: Job[]; pending: number; totalViewers: number; todaySpeech: number; todayChars: number; used: number; cloneUsed: number; pendingDesigns: number; configured: boolean };
-type Page = 'overview' | 'analytics' | 'events' | 'voices' | 'viewers' | 'designs' | 'logs' | 'settings';
 let adminToken = '';
 class RequestError extends Error { constructor(message: string, public status: number) { super(message); } }
 async function request(path: string, body?: unknown, method = body === undefined ? 'GET' : 'POST', signal?: AbortSignal) {
@@ -37,7 +37,8 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 function Toggle({ value, onChange, title, detail }: { value: boolean; onChange: (v: boolean) => void; title: string; detail?: string }) { return <label className="toggle-row"><span><b>{title}</b>{detail && <small>{detail}</small>}</span><input type="checkbox" role="switch" checked={value} onChange={e => onChange(e.target.checked)} /><span className="switch" /></label>; }
 function Modal({ title, children, close }: { title: string; children: React.ReactNode; close: () => void }) { return <div className="modal-shade" onClick={close}><section role="dialog" aria-modal="true" aria-label={title} className="modal" onClick={e => e.stopPropagation()}><div className="card-head"><h2>{title}</h2><button className="icon-button" aria-label="关闭弹窗" onClick={close}><X size={20} /></button></div>{children}</section></div>; }
 function App() {
-  const [status, setStatus] = useState<Status | null>(null), [page, setPage] = useState<Page>(location.hash === '#analytics' ? 'analytics' : 'overview');
+  const [status, setStatus] = useState<Status | null>(null);
+  const [page, setPage] = useHashPage();
   const [voices, setVoices] = useState<Voice[]>([]), [logs, setLogs] = useState<LogEntry[]>([]);
   const [toast, setToast] = useState(''), [fatal, setFatal] = useState(''), [busy, setBusy] = useState('');
   const [playerState, setPlayerState] = useState<'waiting' | 'starting' | 'blocked' | 'playing' | 'other' | 'stopped' | 'error'>('waiting');
@@ -163,7 +164,7 @@ function App() {
   const playerTitle = playing ? '播放器就绪，等待下一条弹幕' : !canPlay ? !s.enabled ? '播报已暂停' : s.mode !== 'bridge' ? '当前由 LAPLACE 播放' : '等待配置语音服务' : ({ waiting: '正在准备自动播放', starting: '正在启动播放器', blocked: '点击页面任意位置，即可启用声音', other: '另一个后台页面正在播放', stopped: '本页面已手动停止播放', error: '播放器连接异常，请重试' } as const)[playerState];
   const playerDetail = playing ? '保持此页面开启，弹幕将自动播报。' : playerState === 'blocked' ? '浏览器暂未允许自动播放；点击或按键后会自动开启，无需寻找开关。' : playerState === 'other' ? '此页面会等待播放权限释放，避免重复播报。' : playerState === 'stopped' ? '点击恢复播放即可继续；重新打开或刷新页面时默认自动开启。' : '页面打开后默认尝试开启播放器。';
   return <div className="app-shell">
-    <aside className="sidebar"><a className="brand" href="/" aria-label="DM Reader 首页"><span className="brand-symbol"><AudioLines size={25} /></span><span>DM Reader<small>让弹幕，自带声场</small></span></a><div className="nav-label">WORKSPACE</div><nav>{nav.map(n => <button key={n.id} className={page === n.id ? 'nav active' : 'nav'} onClick={() => setPage(n.id)}><n.icon size={19} /><span>{n.title}</span>{n.id === 'designs' && status.pendingDesigns > 0 && <i>{status.pendingDesigns}</i>}{page === n.id && <span className="nav-dot" />}</button>)}</nav><div className="sidebar-bottom"><div className="local-note"><ShieldCheck size={17} /><span>本地运行 · 偏好留在本机</span></div><button className="help-button" onClick={() => setHelp(true)}><CircleHelp size={18} />使用指南<ChevronRight size={15} /></button><small className="version">DM Reader 0.1 · Doubao TTS 2.0</small></div></aside>
+    <aside className="sidebar"><a className="brand" href="#overview" aria-label="DM Reader 首页"><span className="brand-symbol"><AudioLines size={25} /></span><span>DM Reader<small>让弹幕，自带声场</small></span></a><div className="nav-label">WORKSPACE</div><nav>{nav.map(n => <a key={n.id} href={`#${n.id}`} className={page === n.id ? 'nav active' : 'nav'} aria-current={page === n.id ? 'page' : undefined}><n.icon size={19} /><span>{n.title}</span>{n.id === 'designs' && status.pendingDesigns > 0 && <i>{status.pendingDesigns}</i>}{page === n.id && <span className="nav-dot" />}</a>)}</nav><div className="sidebar-bottom"><div className="local-note"><ShieldCheck size={17} /><span>本地运行 · 偏好留在本机</span></div><button className="help-button" onClick={() => setHelp(true)}><CircleHelp size={18} />使用指南<ChevronRight size={15} /></button><small className="version">DM Reader 0.1 · Doubao TTS 2.0</small></div></aside>
     <main><header className="topbar"><div className="breadcrumb">工作空间 <ChevronRight size={14} /> <b>{current.title}</b></div><div className="top-right"><Badge tone={status.bridgeConnections ? 'green' : ''}><span className={`dot ${status.bridgeConnections ? 'green-dot' : ''}`} />{status.bridgeConnections ? '弹幕桥已连接' : '等待弹幕连接'}</Badge><span className="room-label">房间 {s.roomId}</span><span className="avatar">Y</span></div></header>
     <div className="main-content"><div className="page-heading"><div><div className="eyebrow">{page === 'overview' ? 'YOUR LIVE, YOUR VOICE' : 'DM READER / STUDIO'}</div><h1>{current.title}<span className="heading-dot">.</span></h1><p>{current.sub}</p></div><button className="button secondary" onClick={() => setHelp(true)}><CircleHelp size={16} />使用指南</button></div>
       {fatal && <div role="alert" className="notice danger">连接中断：{fatal}<button onClick={() => location.reload()}>刷新后台</button></div>}
