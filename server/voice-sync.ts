@@ -1,25 +1,15 @@
-import { createHash, createHmac } from 'node:crypto';
 import { z } from 'zod';
 import { AppError, type OpenApiCredentials, type Voice } from './types.js';
 import { Store } from './store.js';
 import { voices as bundledVoices } from './voices.js';
 import catalog from './voice-catalog.json';
+import { speechOpenApiHeaders, speechOpenApiUrl } from './openapi.js';
 
 // Official ListSpeakers, version 2025-05-20. This is the OpenAPI control plane,
 // authenticated by AK/SK, not the X-Api-Key used by openspeech synthesis.
-export const LIST_SPEAKERS_URL = 'https://open.volcengineapi.com/?Action=ListSpeakers&Version=2025-05-20';
-const hash = (s: string) => createHash('sha256').update(s).digest('hex');
-const hmac = (key: string | Buffer, s: string) => createHmac('sha256', key).update(s).digest();
+export const LIST_SPEAKERS_URL = speechOpenApiUrl('ListSpeakers');
 export function listSpeakersHeaders(body: string, credentials: OpenApiCredentials, now = new Date()) {
-  // Canonicalization follows volcengine/volc-sdk-nodejs src/base/sign.ts.
-  const date = now.toISOString().replace(/[:-]|\.\d{3}/g, ''), day = date.slice(0, 8);
-  const scope = `${day}/cn-beijing/speech_saas_prod/request`, digest = hash(body);
-  const signed = 'host;x-content-sha256;x-date';
-  const canonical = ['POST', '/', 'Action=ListSpeakers&Version=2025-05-20', `host:open.volcengineapi.com\nx-content-sha256:${digest}\nx-date:${date}\n`, signed, digest].join('\n');
-  const key = hmac(hmac(hmac(hmac(credentials.secretAccessKey, day), 'cn-beijing'), 'speech_saas_prod'), 'request');
-  const signature = hmac(key, ['HMAC-SHA256', date, scope, hash(canonical)].join('\n')).toString('hex');
-  return { 'Content-Type': 'application/json; charset=UTF-8', 'X-Date': date, 'X-Content-Sha256': digest,
-    Authorization: `HMAC-SHA256 Credential=${credentials.accessKeyId}/${scope}, SignedHeaders=${signed}, Signature=${signature}` };
+  return speechOpenApiHeaders('ListSpeakers', body, credentials, now);
 }
 
 const short = z.string().trim().max(400);

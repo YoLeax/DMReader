@@ -74,6 +74,16 @@ npm start
 
 TTS 统计按请求发起时间和房间归档；成功后按服务返回字数校正，失败或不明结果继续保留预估消耗，缓存不新增字数。预算是整个本地服务的累计保护（标准预算包含「历史已用」），不是火山账户实时余额，也不受看板的日期筛选影响。合成成功不等于浏览器实际完成播放，队列后续跳过原因仍可在活动记录查看。
 
+## 云端资源包余额
+
+「直播控制台」「数据看板」「接入与设置」均显示**火山云端资源包余额**，标准 TTS 2.0 与声音复刻 2.0 分开显示。使用官方 `ResourcePacksStatus` 查询接口（版本 `2025-05-20`），复用音色同步已保存的 OpenAPI AK / SK，需要该动作的查询权限。此查询不调用语音合成、不消耗 TTS 字数；语音合成 API Key 不能用于查询。
+
+默认查询火山项目 `default`，可在「查询设置」改为合成 API Key 所属的项目名称。服务运行期间默认每 5 分钟刷新，也可点击「查询云端额度」手动刷新（最短间隔 10 秒）。页面标明最近成功查询时间；页面轮询仅读取本地缓存，不会每次都请求火山。失败保留上次结果并提示过期，自动重试至少间隔 1 分钟；从未查询成功显示「—」，不会以本地预算或 0 冒充余额。更换 AK / SK 或项目后不沿用旧账户 / 项目的结果。最后一次成功结果和查询设置在重启后保留。
+
+请求的计费资源 ID 为 `volc.seedtts.default` 和 `volc.seedicl.default`，与合成请求中的 `seed-tts-2.0` / `seed-icl-2.0` 不同。完整读取分页，只累计有效且未到期的预付费字数包，包括赠送资源包；按每个包的 `Harvest.PurchasedAmount` 与 `Harvest.CurrentUsage` 计算剩余字数。并发配额、音色槽位、其他资源和后付费额度不计入。资源包明细可以展开查看；接口字段、单位或分页异常时整次更新失败，避免用不完整数据覆盖旧结果。
+
+这是云端查询时刻的资源包余额，火山侧用量可能有更新延迟；不受看板日期筛选影响，也不表示后付费是否能继续使用。原来的数字已明确改称「本地累计播报保护」，继续独立控制是否允许合成。查询不会自动调整本地上限、历史已用或观众配置。
+
 ## 音色与文字设计
 
 内置 **445 个官方豆包 2.0 音色**（2026-10-01 对照官方主表 294 个与外语表 151 个，无重复 ID），包含 Lily。支持名称 / ID / 语种 / 场景搜索、语种筛选、试听和默认音色设置。名称与 ID 逐项取自官方资料，不根据名称拼接 ID。目录收录不等于当前账户逐项获得调用权限；未声明风格能力的音色以实际效果为准。
@@ -142,7 +152,7 @@ npm run build
 
 测试覆盖：UID 隔离、持久化、改名、指令解析与冷却、房间筛选、事件去重、播放器租约、屏蔽与静音、缓存、并发预算、失败计数、专属音色申请与槽位防复用、NDJSON/SSE 分片解析、CORS、Host/Origin 检查、API 身份验证、导入导出和真实 WebSocket 协议握手。
 
-主要文件：`server/app.ts`（HTTP / WebSocket）、`server/engine.ts`（业务规则）、`server/provider.ts`（火山调用）、`server/store.ts`（SQLite）、`server/voice-catalog.json`（内置目录）、`server/voice-sync.ts`（OpenAPI 签名 / 分页 / 持久同步）、`src/main.tsx`（后台与播放器）。
+主要文件：`server/app.ts`（HTTP / WebSocket）、`server/engine.ts`（业务规则）、`server/provider.ts`（火山调用）、`server/store.ts`（SQLite）、`server/voice-catalog.json`（内置目录）、`server/openapi.ts`（OpenAPI 签名）、`server/voice-sync.ts`（音色目录同步）、`server/quota-sync.ts`（云端资源包查询与缓存）、`src/main.tsx`（后台与播放器）。
 
 2026-10-01 已在真实房间通过 LAPLACE 收到弹幕事件，确认 `origin=659719`，字段包括 `uid`、`username`、`message`、`id`、`timestampNormalized` 等。音色/风格指令保存后，普通弹幕以对应声音合成并在后台播放器完成播放。
 
@@ -153,9 +163,14 @@ npm run build
 - [豆包 HTTP 单向流式语音合成](https://docs.volcengine.com/docs/DoubaoVoice/unidirectional-streaming-text-to-speech-http?lang=zh)
 - [豆包音色列表](https://docs.volcengine.com/docs/DoubaoVoice/Tonelist-1?lang=zh)
 - [ListSpeakers 官方音色列表 API](https://api.volcengine.com/api-docs/view?action=ListSpeakers&serviceCode=speech_saas_prod&version=2025-05-20)
+- [ResourcePacksStatus 官方资源包查询 API](https://api.volcengine.com/api-docs/view?action=ResourcePacksStatus&serviceCode=speech_saas_prod&version=2025-05-20)
 - [豆包语音 OpenAPI SDK 与 AK/SK 接入](https://api.volcengine.com/api-sdk?serviceCode=speech_saas_prod&version=2025-05-20)
 - [音色设计 API](https://docs.volcengine.com/docs/DoubaoVoice/SoundDesignAPI?lang=zh)
 
 ### 2026-10-01 音色补全与同步验证
 
 48 项自动化测试通过，包含列表分页、字段校验、失败回退、持久化、每日更新 / 失败退避、密钥独立加密、UID 偏好与热更新。HMAC 请求签名与官方 `@volcengine/openapi@1.36.2` 相同输入的结果一致。真实合成接口已成功返回 Lily 与一个官方 `ICL_uranus` 预置音色的短句音频，分别计费 6 字，均走 `seed-tts-2.0`；没有调用专属音色设计。列表接口尚待用户配置 OpenAPI AK / SK 后验证真实同步；其余新增音色未逐一试听，不保证当前账户全部有权限。
+
+### 2026-10-02 云端额度验证
+
+已使用保存的 AK / SK 成功调用 `ResourcePacksStatus`，核对标准 TTS 2.0、声音复刻 2.0 两类赠送字数包的总量、用量及剩余值与控制台一致。新增测试覆盖正确计费 ID / 签名、分页、赠送包、资源类型和有效期过滤、异常字段、空余额与未知余额区别、失败保留快照、刷新间隔、持久化、项目 / 凭据隔离、接口权限及查询不触发合成。

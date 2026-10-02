@@ -11,6 +11,7 @@ import { DoubaoProvider, silentWav } from './provider.js';
 import { AppError, type Voice } from './types.js';
 import { eventTypes, type EventType, type InteractionAction } from '../shared/events.js';
 import { VoiceCatalogSync, type CatalogFetch } from './voice-sync.js';
+import { CloudQuotaSync } from './quota-sync.js';
 
 const localHost = /^(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i;
 const localOrigin = (value: string) => /^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(value);
@@ -30,15 +31,18 @@ const settingsPatch = z.object({
 }).partial().strict();
 const sessionSchema = z.object({ session: z.string().uuid() });
 
-export function createService(options: { dataDir: string; distDir?: string; provider?: Pick<DoubaoProvider, 'synthesize' | 'design'>; catalogFetch?: CatalogFetch }) {
+export function createService(options: { dataDir: string; distDir?: string; provider?: Pick<DoubaoProvider, 'synthesize' | 'design'>; catalogFetch?: CatalogFetch; quotaFetch?: typeof fetch }) {
   const store = new Store(options.dataDir);
   const engine = new Engine(store, options.provider || new DoubaoProvider(() => store.credentials()));
   const catalogSync = new VoiceCatalogSync(store, options.catalogFetch);
-  const syncTimer = setInterval(() => { void catalogSync.refreshIfDue().catch(() => {}); }, 60000);
+  const quotaSync = new CloudQuotaSync(store, options.quotaFetch);
+  const status = () => ({ ...engine.status(), cloudQuota: quotaSync.status() });
+  const refreshCloud = () => { void catalogSync.refreshIfDue().catch(() => {}); void quotaSync.refreshIfDue().catch(() => {}); };
+  const syncTimer = setInterval(refreshCloud, 60000);
   syncTimer.unref();
   const app = express();
   const server = createServer(app);
-  server.once('listening', () => { void catalogSync.refreshIfDue().catch(() => {}); });
+  server.once('listening', refreshCloud);
   const adminToken = randomBytes(32).toString('hex');
   app.disable('x-powered-by');
   app.use((req, res, next) => {
@@ -62,8 +66,16 @@ export function createService(options: { dataDir: string; distDir?: string; prov
     if (!matches(req.headers['x-dmreader-admin'], adminToken)) return res.status(401).json({ error: '后台会话已失效，请刷新页面。' });
     next();
   });
-  app.get('/api/bootstrap', (_req, res) => res.json({ adminToken, status: engine.status() }));
-  app.get('/api/status', (_req, res) => res.json(engine.status()));
+  app.get('/api/bootstrap', (_req, res) => res.json({ adminToken, status: status() }));
+  app.get('/api/status', (_req, res) => res.json(status()));
+  app.get('/api/cloud-quota', (_req, res) => res.json(quotaSync.status()));
+  app.post('/api/cloud-quota', async (_req, res) => { await quotaSync.sync(); res.json(quotaSync.status()); });
+  app.patch('/api/cloud-quota', (req, res) => {
+    const input = z.object({ project: z.string().trim().min(1).max(100).regex(/^[A-Za-z0-9_.-]+$/).optional(), enabled: z.boolean().optional() }).strict().parse(req.body);
+    if (input.project !== undefined) store.set('quotaProject', input.project);
+    if (input.enabled !== undefined) store.set('quotaAutoSync', input.enabled);
+    void quotaSync.refreshIfDue().catch(() => {}); res.json(quotaSync.status());
+  });
   app.get('/api/analytics', (req, res) => {
     const range = z.enum(['today', 'yesterday', '7d', '30d']).parse(req.query.range ?? 'today');
     const settings = store.settings();
@@ -78,7 +90,7 @@ export function createService(options: { dataDir: string; distDir?: string; prov
   });
   app.post('/api/voice-sync/credentials', (req, res) => {
     const c = z.object({ accessKeyId: z.string().trim().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/), secretAccessKey: z.string().trim().min(1).max(2000) }).strict().parse(req.body);
-    store.saveOpenApiCredentials(c); res.json(catalogSync.status());
+    store.saveOpenApiCredentials(c); void quotaSync.refreshIfDue().catch(() => {}); res.json(catalogSync.status());
   });
   app.get('/api/logs', (_req, res) => res.json(store.logs(200)));
   app.get('/api/event', (req, res) => res.json(engine.recentEvent(typeof req.query.type === 'string' ? req.query.type : undefined)));
@@ -222,11 +234,11 @@ export function createService(options: { dataDir: string; distDir?: string; prov
     ws.on('close', () => { clearInterval(heartbeat); engine.bridgeConnections--; });
   });
   async function close() {
-    clearInterval(syncTimer); await catalogSync.close();
+    clearInterval(syncTimer); await Promise.all([catalogSync.close(), quotaSync.close()]);
     for (const client of wss.clients) if (client.readyState !== WebSocket.CLOSED) client.terminate();
     await new Promise<void>(r => wss.close(() => r()));
     if (server.listening) await new Promise<void>(r => server.close(() => r()));
     store.close();
   }
-  return { app, server, store, engine, close };
+  return { app, server, store, engine, quotaSync, close };
 }

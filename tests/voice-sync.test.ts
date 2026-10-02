@@ -101,7 +101,7 @@ test('catalog admin endpoints protect credentials and hot-load a synced voice fo
   const f = fixture(); let fetches = 0;
   // Prevent startup synchronization; the HTTP request below explicitly triggers it.
   f.store.set('voiceAutoSync', false);
-  const service = createService({ dataDir: f.dir, catalogFetch: async () => { fetches++; return response([speaker()]); } });
+  const service = createService({ dataDir: f.dir, quotaFetch: async () => Response.json({ Result: { Packs: [], TotalCount: 0 } }), catalogFetch: async () => { fetches++; return response([speaker()]); } });
   service.server.listen(0, '127.0.0.1'); await once(service.server, 'listening');
   const base = `http://127.0.0.1:${(service.server.address() as { port: number }).port}`;
   try {

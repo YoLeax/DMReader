@@ -3,6 +3,8 @@ import { Activity, AudioLines, ChartNoAxesCombined, Coins, MessageSquare, Refres
 import type { AnalyticsRange, AnalyticsReport } from '../server/analytics';
 import { eventLabels, type EventType } from '../shared/events';
 import './analytics.css';
+import type { CloudQuotaStatus } from '../server/quota-sync';
+import { cloudQuotaNote } from './CloudQuotaPanel';
 
 const fmt = (n: number) => n.toLocaleString('zh-CN');
 const percent = (n: number | null) => n === null ? '—' : `${(n * 100).toFixed(1)}%`;
@@ -56,7 +58,7 @@ function Budget({ title, value }: { title: string; value: AnalyticsReport['budge
   return <div className="an-budget"><div><b>{title}</b><span>{value.limit === 0 ? '未开放额度' : `剩余 ${fmt(value.remaining)} 字`}</span></div><div className="an-track"><i style={{ width: `${ratio * 100}%`, background: ratio >= .9 ? '#cb7658' : '#8d79d9' }} /></div><p>累计已用 {fmt(value.used)} <span>/ 本地上限 {fmt(value.limit)} 字</span></p></div>;
 }
 
-export function AnalyticsDashboard({ api, room }: { api: <T>(path: string) => Promise<T>; room: string }) {
+export function AnalyticsDashboard({ api, room, quota, quotaPanel }: { api: <T>(path: string) => Promise<T>; room: string; quota?: CloudQuotaStatus; quotaPanel?: React.ReactNode }) {
   const [range, setRange] = useState<AnalyticsRange>('today'), [data, setData] = useState<AnalyticsReport | null>(null);
   const [error, setError] = useState(''), [loading, setLoading] = useState(true), [revision, setRevision] = useState(0);
   useEffect(() => {
@@ -83,8 +85,9 @@ export function AnalyticsDashboard({ api, room }: { api: <T>(path: string) => Pr
         <MetricCard label="收到弹幕" value={s.messages} unit="条" detail={`正文 ${fmt(s.messageChars)} 字 · 其中指令 ${fmt(s.commands)} 条`} icon={MessageSquare} />
         <MetricCard label="发言观众" value={s.speakers} unit="人" detail={`按 UID 去重 · 全部互动观众 ${fmt(s.interactingViewers)} 人`} icon={Users} />
         <MetricCard label="时段 TTS 消耗" value={s.chars} unit="字" detail={`全部合成来源 · 缓存约节省 ${fmt(s.savedChars)} 字`} icon={AudioLines} />
-        <MetricCard label="标准音色剩余额度" value={data.budget.standard.remaining} unit="字" detail="本地累计预算 · 不随时间范围变化" icon={Coins} accent />
+        <MetricCard label="标准音色云端余量" value={quota?.standard?.remaining ?? '—'} unit="字" detail={cloudQuotaNote(quota)} icon={Coins} accent />
       </div>
+      {quotaPanel}
       <div className="an-two"><Trend bins={data.bins} step={data.step} title="直播间活跃趋势" options={[[ 'messages', '弹幕量', '条' ], [ 'activeViewers', '发言人数', '人' ], [ 'events', '全部事件', '条' ]]} color="#8268cd" /><Trend bins={data.bins} step={data.step} title="语音合成趋势" options={[[ 'chars', '消耗字数', '字' ], [ 'success', '合成成功', '次' ], [ 'cached', '缓存复用', '次' ], [ 'failure', '合成失败', '次' ]]} color="#29988d" /></div>
       <section className="card an-quality"><div className="an-section-head"><h2><Activity size={17} />语音服务表现</h2><span>所选时段 · 全部来源</span></div><div className="an-quality-grid">
         <div><span>云端合成成功率</span><b>{percent(s.successRate)}</b><small>{fmt(s.successes)} 次成功 / {fmt(s.failures)} 次失败</small></div>
@@ -101,12 +104,12 @@ export function AnalyticsDashboard({ api, room }: { api: <T>(path: string) => Pr
         <section className="card an-viewers"><div className="an-section-head"><h2>活跃发言观众</h2><span>TOP 8 · 按弹幕数</span></div>{data.topViewers.length ? <div className="an-table-wrap"><table><thead><tr><th>观众</th><th>弹幕</th><th>正文字符</th></tr></thead><tbody>{data.topViewers.map((v, i) => <tr key={v.uid}><td><span className="an-rank">{i + 1}</span><span className="an-viewer-name" title={v.username}>{v.username}<small>UID {v.uid}</small></span></td><td>{fmt(v.messages)}</td><td>{fmt(v.chars)}</td></tr>)}</tbody></table></div> : <div className="an-empty"><Users size={25} /><p>还没有观众发言，等待第一条弹幕。</p></div>}<p className="an-caption">仅统计真实普通 / 特效弹幕，包含指令；同一 UID 改名后仍归为一人。</p></section>
         <Distribution title="热门播报音色" rows={data.topVoices.map(r => ({ ...r, label: r.name }))} empty="开始播报或试听后，会显示使用过的声音。" foot="TOP 6 · 按成功合成与缓存复用次数排序，包含试听和本地模拟。" />
       </div>
-      <section className="card"><div className="an-section-head"><h2>字数预算</h2><span>累计 · 不受上方日期筛选影响</span></div><div className="an-two an-budgets"><Budget title="标准音色 · TTS 2.0" value={data.budget.standard} /><Budget title="专属音色 · 声音复刻" value={data.budget.custom} /></div><p className="an-caption">这是本地额度保护，不是火山账户实时余额。标准额度已包含手动填写的历史已用字数；请求失败或结果不明时保留预估消耗，成功后按返回字数校正。缓存节省为估算值。</p></section>
+      <section className="card"><div className="an-section-head"><h2>本地累计播报保护</h2><span>累计 · 不受上方日期筛选影响</span></div><div className="an-two an-budgets"><Budget title="标准音色 · TTS 2.0" value={data.budget.standard} /><Budget title="专属音色 · 声音复刻" value={data.budget.custom} /></div><p className="an-caption">这是本地额度保护，不是火山账户实时余额。标准额度已包含手动填写的历史已用字数；请求失败或结果不明时保留预估消耗，成功后按返回字数校正。缓存节省为估算值。</p></section>
       <details className="an-definitions"><summary>统计口径与数据保留</summary><ul><li>仅统计当前房间、服务运行且 Bridge 已接入期间收到的事件。数据保留最近 {data.retentionDays} 个自然日，按小时汇总，独立于最多 3,000 条的活动日志；重启保留统计。</li><li>发言观众按可靠 UID 去重，不代表在线人数。进场、礼物等有可靠 UID 的观众计入「全部互动观众」，没有 UID 的事件只计事件数。</li><li>所选时段另收到 {fmt(s.simulatedEvents)} 条本地模拟事件，不计入真实弹幕、活跃观众和指令排行；模拟产生的语音仍消耗额度，所以计入 TTS 统计。</li><li>不会从旧日志推算历史人数或趋势；暂停播报、关闭事件开关不影响接收计数。离线期间未收到的数据不会补录，礼物和点赞统计的是事件条数。</li></ul></details>
     </>}
   </div>;
 }
 
-function MetricCard({ label, value, unit, detail, icon: Icon, accent = false }: { label: string; value: number; unit: string; detail: string; icon: typeof Activity; accent?: boolean }) {
-  return <section className={`an-metric${accent ? ' an-metric-accent' : ''}`}><div><span>{label}</span><Icon size={18} /></div><p>{fmt(value)}<small>{unit}</small></p><span>{detail}</span></section>;
+function MetricCard({ label, value, unit, detail, icon: Icon, accent = false }: { label: string; value: number | string; unit: string; detail: string; icon: typeof Activity; accent?: boolean }) {
+  return <section className={`an-metric${accent ? ' an-metric-accent' : ''}`}><div><span>{label}</span><Icon size={18} /></div><p>{typeof value === 'number' ? fmt(value) : value}<small>{unit}</small></p><span>{detail}</span></section>;
 }
