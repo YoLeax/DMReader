@@ -9,7 +9,8 @@ import { request as httpRequest } from 'node:http';
 import { WebSocket } from 'ws';
 import { Store } from '../server/store.js';
 import { Engine, identity, parseCommand } from '../server/engine.js';
-import { voices } from '../server/voices.js';
+import { voices, resolveVoiceCommand } from '../server/voices.js';
+import type { Voice } from '../server/types.js';
 import { parseAudio, synthesisBody, authHeaders, DoubaoProvider, silentWav, type Synthesis } from '../server/provider.js';
 import { createService } from '../server/app.js';
 
@@ -55,6 +56,60 @@ test('foreign and official preset names resolve without changing resource or vie
     }
     assert.equal(f.store.spent('seed-icl-2.0'), 0);
     assert.equal(f.store.viewer('foreign-0')?.voice, 'ja_female_bv523_uranus_bigtts');
+  } finally { f.close(); }
+});
+
+test('voice commands accept names, version suffixes, case-insensitive IDs and truncated prefixes', () => {
+  const f = fixture();
+  try {
+    const uid = 'loose-voice', expected = 'ja_female_bv523_uranus_bigtts';
+    f.store.touch(uid, '音色测试');
+    f.store.updateViewer(uid, { style: '开心地说', speed: 20 });
+    for (const input of ['Lily', 'lily', 'Lily 2.0', 'Lily2.0', 'Lily v2.0', 'Lily（2.0）', 'Lily ( V2.0 )', ' Ｌｉｌｙ２．０ ', expected, expected.toUpperCase(), 'ja_female_bv523_ura']) {
+      assert.match(f.engine.command(f.store.viewer(uid)!, `#音色 ${input}`), /Lily/);
+      assert.equal(f.store.viewer(uid)?.voice, expected, input);
+      assert.equal(f.store.viewer(uid)?.style, '开心地说');
+      assert.equal(f.store.viewer(uid)?.speed, 20);
+    }
+    for (const input of ['', '2.0', '不存在的音色', 'bv523_uranus']) {
+      assert.throws(() => f.engine.command(f.store.viewer(uid)!, `#音色 ${input}`), /没有找到/);
+      assert.equal(f.store.viewer(uid)?.voice, expected);
+    }
+    // Loose matching belongs to the command, not to stored IDs or admin settings.
+    assert.equal(f.engine.voice('ja_female_bv523_ura'), undefined);
+  } finally { f.close(); }
+});
+
+test('voice command exact matches beat ID prefixes; ambiguous names and prefixes choose the first eligible voice', () => {
+  const make = (id: string, name: string, extra: Partial<Voice> = {}): Voice => ({ id, name, gender: '男声', tag: '测试', description: '', resource: 'seed-tts-2.0', ...extra });
+  const catalog = [make('prefix_voice_long', '同名', { aliases: ['旧名称'] }), make('prefix_voice', '同名', { aliases: ['旧名称'] }), make('other_voice', 'prefix_', { aliases: ['旧名2.0'] })];
+  assert.equal(resolveVoiceCommand(catalog, 'prefix_voice')?.id, 'prefix_voice');
+  assert.equal(resolveVoiceCommand(catalog, 'PREFIX_VOICE')?.id, 'prefix_voice');
+  assert.equal(resolveVoiceCommand(catalog, 'prefix_')?.id, 'other_voice');
+  assert.equal(resolveVoiceCommand(catalog, '旧名')?.id, 'other_voice');
+  for (const input of ['prefix_v', '同名', '同名2.0', '旧名称（2.0）']) assert.equal(resolveVoiceCommand(catalog, input)?.id, 'prefix_voice_long');
+  assert.equal(resolveVoiceCommand([...catalog].reverse(), 'prefix_v')?.id, 'prefix_voice');
+  const withPersonal = [make('prefix_private', '同名', { resource: 'seed-icl-2.0' }), ...catalog];
+  assert.equal(resolveVoiceCommand(withPersonal, 'prefix')?.id, 'prefix_voice_long');
+  assert.equal(resolveVoiceCommand(withPersonal, '同名')?.id, 'prefix_voice_long');
+  assert.equal(resolveVoiceCommand(withPersonal, 'prefix_private'), undefined);
+  assert.equal(resolveVoiceCommand(catalog, ' '), undefined);
+});
+
+test('a truncated Bridge command persists the full ID and speaks confirmation with the resolved voice', async () => {
+  const f = fixture();
+  try {
+    f.engine.claimPlayer('command-player');
+    const uid = 'prefix-bridge';
+    const result = f.engine.ingest({ type: 'message', origin: f.store.settings().roomId, id: randomUUID(), uid, username: '测试观众', message: '#音色 zh_female_xiaohe_ura' });
+    assert.equal(result.command, '已记住音色：小何');
+    assert.equal(f.store.viewer(uid)?.voice, 'zh_female_xiaohe_uranus_bigtts');
+    await f.engine.next('command-player');
+    assert.equal(f.calls[0].voice.id, 'zh_female_xiaohe_uranus_bigtts');
+    assert.equal(f.calls[0].text, '测试观众开始使用小何音色。');
+    const reopened = new Store(f.dir);
+    assert.equal(reopened.viewer(uid)?.voice, 'zh_female_xiaohe_uranus_bigtts');
+    reopened.close();
   } finally { f.close(); }
 });
 test('same-name viewers are isolated; settings survive restart and rename', () => {

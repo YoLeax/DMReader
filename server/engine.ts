@@ -6,6 +6,7 @@ import { type EventType, type InteractionAction } from '../shared/events.js';
 export { identity } from './events.js';
 import { authHeaders, type AudioResult, type Synthesis, DoubaoProvider } from './provider.js';
 import { mergedVoices } from './voice-sync.js';
+import { resolveVoiceCommand } from './voices.js';
 
 export interface Job { id: string; uid: string; username: string; text: string; created: number; eventType: EventType | 'command'; action?: InteractionAction; announceName: boolean; }
 interface IngestResult { ignored?: boolean; duplicate?: boolean; queued?: boolean; skipped?: string; command?: string; }
@@ -130,8 +131,8 @@ export class Engine {
     const last = this.store.get<number>(`cooldown:${v.uid}`) || 0;
     if (!readOnly && Date.now() - last < s.cooldownSeconds * 1000) throw new AppError(`修改太快啦，请等待 ${Math.ceil((s.cooldownSeconds * 1000 - Date.now() + last) / 1000)} 秒。`);
     if (c.name === '音色') {
-      const voice = this.voice(c.arg);
-      if (!voice || voice.resource !== 'seed-tts-2.0') throw new AppError('没有找到这个官方音色，请发送 #音色列表 查看可选名称。');
+      const voice = resolveVoiceCommand(this.voices(), c.arg);
+      if (!voice) throw new AppError('没有找到这个官方音色，请填写名称、带 2.0 的名称、完整 ID 或 ID 开头部分。');
       this.store.updateViewer(v.uid, { voice: voice.id }); detail = `已记住音色：${voice.name}`;
     } else if (c.name === '风格') {
       if (!s.allowStyles) throw new AppError('主播暂时关闭了风格指令。');

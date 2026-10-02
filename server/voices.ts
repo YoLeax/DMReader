@@ -14,3 +14,21 @@ export const voices: Voice[] = catalog.voices.map(entry => ({
   description: `豆包 2.0 · ${entry.language} · ${entry.capabilities || '官方预置音色；风格能力以实际效果为准'}`,
   resource: 'seed-tts-2.0',
 }));
+
+const normalize = (value: string) => value.normalize('NFKC').trim().toLowerCase();
+const withoutVersion = (value: string) => value.replace(/\s*(?:\(\s*v?2\.0\s*\)|v?2\.0)$/, '').trim();
+
+// Danmaku may truncate a long ID. Resolve this only at command entry, then store
+// the full ID; saved IDs and admin configuration must not silently change voices.
+export function resolveVoiceCommand(catalog: Voice[], input: string): Voice | undefined {
+  const query = normalize(input);
+  if (!query) return undefined;
+  const available = catalog.filter(v => v.resource === 'seed-tts-2.0');
+  const names = (v: Voice) => [v.name, ...(v.aliases || [])].map(normalize);
+  const shortName = withoutVersion(query);
+  return available.find(v => v.id === input.trim())
+    || available.find(v => normalize(v.id) === query)
+    || available.find(v => names(v).includes(query))
+    || (shortName ? available.find(v => names(v).some(n => withoutVersion(n) === shortName)) : undefined)
+    || available.find(v => normalize(v.id).startsWith(query));
+}
