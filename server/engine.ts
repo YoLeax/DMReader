@@ -7,8 +7,9 @@ export { identity } from './events.js';
 import { authHeaders, type AudioResult, type Synthesis, DoubaoProvider } from './provider.js';
 import { mergedVoices } from './voice-sync.js';
 import { resolveVoiceCommand } from './voices.js';
+import { analyticsSource, receptionOutcome, type AnalyticsSource, type UsageContext } from './analytics.js';
 
-export interface Job { id: string; uid: string; username: string; text: string; created: number; eventType: EventType | 'command'; action?: InteractionAction; announceName: boolean; }
+export interface Job { id: string; uid: string; username: string; text: string; created: number; eventType: EventType | 'command'; action?: InteractionAction; announceName: boolean; source: AnalyticsSource; room: string; }
 interface IngestResult { ignored?: boolean; duplicate?: boolean; queued?: boolean; skipped?: string; command?: string; }
 interface EventSnapshot { receivedAt: string; source: string; fields: string[]; event: Record<string, unknown>; result?: IngestResult; }
 export interface Design { id: number; uid: string; username: string; prompt: string; status: string; speaker: string | null; detail: string; createdAt: string; updatedAt: string; }
@@ -56,7 +57,13 @@ export class Engine {
     this.lastEventAt = new Date().toISOString();
     const snapshot: EventSnapshot = { receivedAt: this.lastEventAt, source, fields: Object.keys(data).slice(0, 150), event: inspectEvent(data) };
     this.latest.set(data.type, snapshot); this.lastEvent = snapshot;
-    const finish = (result: IngestResult) => { snapshot.result = result; return result; };
+    const context: UsageContext = { room: s.roomId, source: analyticsSource(source), at: this.now() };
+    const observation = { accepted: false, uid: '', username: '', chars: 0, command: '' };
+    const finish = (result: IngestResult, outcome = receptionOutcome(result)) => {
+      snapshot.result = result;
+      this.store.analytics.reception({ ...context, ...observation, type: data.type as string, outcome });
+      return result;
+    };
     const log = (kind: string, detail: string, text = '') => this.store.log(kind, { eventType: String(data.type), uid: identity(data.uid) || '', username: typeof data.username === 'string' ? boundedText(cleanText(data.username), 100) : '', text, detail: `${source === 'simulation' ? '本地模拟 · ' : ''}${detail}` });
     const parsed = eventSchema.safeParse(data);
     if (!parsed.success) { const detail = `字段异常：${parsed.error.issues.map(i => i.path.join('.')).join('、')}`; log('invalid', detail); return finish({ skipped: detail }); }
@@ -71,19 +78,22 @@ export class Engine {
       log('invalid', '缺少有效 UID，未按昵称关联偏好或执行指令', rawText); return finish({ ignored: true });
     }
     const viewer = uid ? this.store.touch(uid, username) : undefined;
+    Object.assign(observation, { uid: uid || '', username, chars: Array.from(rawText).length });
     if (isMessage && parseCommand(rawText)) {
+      observation.accepted = true; observation.command = parseCommand(rawText)!.name;
       try {
         const detail = this.command(viewer!, rawText);
         const response = this.commandSpeech(this.store.viewer(uid!)!, rawText);
-        if (response) this.enqueue({ uid: uid!, username, text: boundedText(response, s.maxChars), eventType: 'command', announceName: false }, ['查询', '我的音色'].includes(parseCommand(rawText)!.name) ? [`query:${s.roomId}:${uid}`, Math.max(10, s.cooldownSeconds)] : undefined);
+        if (response) this.enqueue({ uid: uid!, username, text: boundedText(response, s.maxChars), eventType: 'command', announceName: false, source: context.source, room: context.room }, ['查询', '我的音色'].includes(parseCommand(rawText)!.name) ? [`query:${s.roomId}:${uid}`, Math.max(10, s.cooldownSeconds)] : undefined);
         return finish({ command: detail });
-      } catch (e) { const detail = e instanceof Error ? e.message : '指令失败'; log('command-error', detail, rawText); return finish({ command: detail }); }
+      } catch (e) { const detail = e instanceof Error ? e.message : '指令失败'; log('command-error', detail, rawText); return finish({ command: detail }, 'command-error'); }
     }
     const text = eventText(event, boundedText(username, 40));
     if (!text) { log('invalid', '缺少可朗读的文字或礼物名称'); return finish({ skipped: '没有有效播报文案' }); }
+    observation.accepted = true;
     if (event.type === 'superchat' && event.deleted) { log('skipped', '醒目留言已删除', text); return finish({ skipped: '醒目留言已删除' }); }
     if (!uid) log('identity-fallback', '缺少可靠 UID，使用直播间默认声音；未按昵称关联档案', text);
-    return finish(this.enqueue({ uid: uid || '', username, text, eventType: event.type, action: event.type === 'interaction' ? String(event.action) as InteractionAction : undefined, announceName: isMessage }, this.eventCooldown(event, uid)));
+    return finish(this.enqueue({ uid: uid || '', username, text, eventType: event.type, action: event.type === 'interaction' ? String(event.action) as InteractionAction : undefined, announceName: isMessage, source: context.source, room: context.room }, this.eventCooldown(event, uid)));
   }
   private eventCooldown(event: ParsedEvent, uid: string | null): [string, number] | undefined {
     const s = this.store.settings(), who = uid || 'anonymous';
@@ -171,10 +181,10 @@ export class Engine {
     }
     if (!job) return null;
     this.playerBusy = true;
-    try { return { job, ...(await this.speak(job.text, { uid: job.uid, username: job.username, source: 'bridge', announceName: job.announceName, eventType: job.eventType, action: job.action })) }; }
+    try { return { job, ...(await this.speak(job.text, { uid: job.uid, username: job.username, source: job.source, room: job.room, announceName: job.announceName, eventType: job.eventType, action: job.action })) }; }
     finally { this.playerBusy = false; }
   }
-  async speak(text: string, options: { uid?: string; username?: string; voice?: string; style?: string; speed?: number; source: string; announceName?: boolean; eventType?: string; action?: InteractionAction }) {
+  async speak(text: string, options: { uid?: string; username?: string; voice?: string; style?: string; speed?: number; source: string; room?: string; announceName?: boolean; eventType?: string; action?: InteractionAction }) {
     if (this.pending >= 20) throw new AppError('合成队列已满，请稍后再试。', 429);
     this.pending++;
     const previous = this.tail; let unlock!: () => void;
@@ -184,7 +194,7 @@ export class Engine {
       const s = this.store.settings(), viewer = options.uid ? this.store.viewer(options.uid) : undefined;
       if (!s.enabled) throw new AppError('播报已暂停。', 409);
       // A preview may hold the synthesis lock while this job waits. Recheck after acquiring it.
-      if (options.source === 'bridge' && (options.eventType === 'command' || supportedEvent(options.eventType)) && this.disabled({ eventType: options.eventType, action: options.action })) {
+      if (['bridge', 'simulation'].includes(options.source) && (options.eventType === 'command' || supportedEvent(options.eventType)) && this.disabled({ eventType: options.eventType, action: options.action })) {
         this.store.log('disabled', { ...options, text, detail: '等待合成期间关闭播报，未调用云端' });
         throw new AppError('该类型已关闭播报。', 409);
       }
@@ -201,7 +211,9 @@ export class Engine {
       const input: Synthesis = { text: spoken, voice, style, speed };
       const hash = createHash('sha256').update(JSON.stringify(input)).digest('hex');
       const cached = this.cache.get(hash); const start = Date.now();
+      const context: UsageContext = { room: options.room || s.roomId, source: analyticsSource(options.source), at: this.now() };
       if (cached && Date.now() - cached.time < 3600000) {
+        this.store.analytics.speech(context, voice, 'cached', 0, cached.result.chars);
         this.store.log('cached', { ...options, text, voice: voice.name, detail: '已复用本地音频 · 未调用云端' });
         return { audio: cached.result.audio, voice: voice.name, chars: 0, cached: true };
       }
@@ -214,16 +226,18 @@ export class Engine {
       if (this.rate.length >= 60) throw new AppError('每分钟最多 60 次云端合成，请稍后再试。', 429);
       this.rate.push(Date.now());
       // Reserve before network dispatch. Unknown outcomes stay counted to avoid overspending.
-      this.store.addUsage(voice.resource, count);
+      this.store.addUsage(voice.resource, count, context);
       try {
         const result = await this.provider.synthesize(input);
-        this.store.addUsage(voice.resource, result.chars - count);
+        this.store.addUsage(voice.resource, result.chars - count, context);
+        this.store.analytics.speech(context, voice, 'success', Date.now() - start);
         if (cached) this.cacheBytes -= cached.result.audio.length;
         this.cache.set(hash, { result, time: Date.now() }); this.cacheBytes += result.audio.length;
         while (this.cache.size > 100 || this.cacheBytes > 20 * 1024 * 1024) { const first = this.cache.keys().next().value!; this.cacheBytes -= this.cache.get(first)!.result.audio.length; this.cache.delete(first); }
         this.store.log('speech', { ...options, text, voice: voice.name, chars: result.chars, latency: Date.now() - start, detail: `${options.source === 'preview' ? '试听' : '已合成'} · ${result.estimated ? '估算字数' : '云端计费字数'}${voice.resource === 'seed-icl-2.0' && style ? ' · 专属音色保留设计时风格' : ''}` });
         return { audio: result.audio, voice: voice.name, chars: result.chars, cached: false };
       } catch (e) {
+        this.store.analytics.speech(context, voice, 'failure', Date.now() - start);
         const detail = e instanceof AppError ? e.message : '请求超时或网络异常。已保留本次预估字数，请到火山控制台核对用量。';
         this.store.log('error', { ...options, text, voice: voice.name, detail });
         throw new AppError(detail, 502);

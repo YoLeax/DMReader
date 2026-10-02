@@ -3,9 +3,11 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
 import { defaults, type Settings, type Viewer, type Credentials, type OpenApiCredentials } from './types.js';
+import { Analytics, type UsageContext } from './analytics.js';
 
 export class Store {
   db: DatabaseSync;
+  analytics: Analytics;
   private key: Buffer;
   constructor(public dir: string) {
     mkdirSync(dir, { recursive: true });
@@ -23,6 +25,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS logs_time ON logs(time);
     `);
     if (!this.db.prepare('PRAGMA table_info(logs)').all().some(c => c.name === 'eventType')) this.db.exec("ALTER TABLE logs ADD COLUMN eventType TEXT NOT NULL DEFAULT ''");
+    this.analytics = new Analytics(this.db);
     if (!this.get('apiToken')) this.set('apiToken', randomBytes(24).toString('hex'));
     this.db.prepare("UPDATE designs SET status='uncertain',detail='服务在生成过程中重启，请先到火山控制台核对槽位；不会自动重试。' WHERE status='processing'").run();
     this.prune();
@@ -84,7 +87,14 @@ export class Store {
   }
   logs(limit = 100) { return this.db.prepare('SELECT * FROM logs ORDER BY id DESC LIMIT ?').all(limit); }
   spent(resource: string): number { return (this.db.prepare('SELECT chars FROM usage WHERE resource=?').get(resource)?.chars as number) || 0; }
-  addUsage(resource: string, chars: number) { this.db.prepare('INSERT INTO usage VALUES (?,?) ON CONFLICT(resource) DO UPDATE SET chars=chars+excluded.chars').run(resource, chars); }
+  addUsage(resource: string, chars: number, context?: UsageContext) {
+    this.db.exec('SAVEPOINT usage_accounting');
+    try {
+      this.db.prepare('INSERT INTO usage VALUES (?,?) ON CONFLICT(resource) DO UPDATE SET chars=chars+excluded.chars').run(resource, chars);
+      if (context) this.analytics.usage(context, resource, chars);
+      this.db.exec('RELEASE usage_accounting');
+    } catch (error) { this.db.exec('ROLLBACK TO usage_accounting; RELEASE usage_accounting'); throw error; }
+  }
   remember(id: string): boolean {
     const now = Date.now();
     const changed = this.db.prepare('INSERT INTO seen VALUES (?,?) ON CONFLICT(id) DO UPDATE SET time=excluded.time WHERE seen.time<?').run(id, now, now - 7 * 86400000).changes > 0;

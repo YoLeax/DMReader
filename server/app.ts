@@ -64,6 +64,11 @@ export function createService(options: { dataDir: string; distDir?: string; prov
   });
   app.get('/api/bootstrap', (_req, res) => res.json({ adminToken, status: engine.status() }));
   app.get('/api/status', (_req, res) => res.json(engine.status()));
+  app.get('/api/analytics', (req, res) => {
+    const range = z.enum(['today', 'yesterday', '7d', '30d']).parse(req.query.range ?? 'today');
+    const settings = store.settings();
+    res.json(store.analytics.report(range, settings, store.spent('seed-tts-2.0') + settings.usedBefore, store.spent('seed-icl-2.0')));
+  });
   app.get('/api/voices', (_req, res) => res.json(engine.voices()));
   app.get('/api/voice-sync', (_req, res) => res.json(catalogSync.status()));
   app.post('/api/voice-sync', async (_req, res) => { await catalogSync.sync(); res.json(catalogSync.status()); });

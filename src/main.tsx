@@ -7,9 +7,10 @@ import { eventTypes, eventLabels, eventDescriptions, interactionLabels, interact
 import { resumeAudio } from './audio';
 import './styles.css';
 import { VoiceSyncPanel } from './VoiceSyncPanel';
+import { AnalyticsDashboard } from './AnalyticsDashboard';
 
 type Status = { settings: Settings; bridgeConnections: number; playerActive: boolean; lastEventAt: string | null; queue: Job[]; pending: number; totalViewers: number; todaySpeech: number; todayChars: number; used: number; cloneUsed: number; pendingDesigns: number; configured: boolean };
-type Page = 'overview' | 'events' | 'voices' | 'viewers' | 'designs' | 'logs' | 'settings';
+type Page = 'overview' | 'analytics' | 'events' | 'voices' | 'viewers' | 'designs' | 'logs' | 'settings';
 let adminToken = '';
 class RequestError extends Error { constructor(message: string, public status: number) { super(message); } }
 async function request(path: string, body?: unknown, method = body === undefined ? 'GET' : 'POST', signal?: AbortSignal) {
@@ -22,6 +23,7 @@ const fmt = (n: number) => n.toLocaleString('zh-CN');
 const time = (s: string) => new Date(s).toLocaleTimeString('zh-CN', { hour12: false });
 const nav: { id: Page; title: string; icon: typeof Radio; sub: string }[] = [
   { id: 'overview', title: '直播控制台', icon: LayoutDashboard, sub: '让每一条弹幕，都有自己的声音。' },
+  { id: 'analytics', title: '数据看板', icon: Activity, sub: '看见直播间的热度，也看清每一份声音的消耗。' },
   { id: 'events', title: '事件播报', icon: Radio, sub: '选择要读出的互动，让直播间热闹得刚刚好。' },
   { id: 'voices', title: '音色实验室', icon: AudioLines, sub: '选一个声音，为直播间添一点性格。' },
   { id: 'viewers', title: '观众档案', icon: Users, sub: '记住声音，也记住每一次相遇。' },
@@ -35,7 +37,7 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 function Toggle({ value, onChange, title, detail }: { value: boolean; onChange: (v: boolean) => void; title: string; detail?: string }) { return <label className="toggle-row"><span><b>{title}</b>{detail && <small>{detail}</small>}</span><input type="checkbox" role="switch" checked={value} onChange={e => onChange(e.target.checked)} /><span className="switch" /></label>; }
 function Modal({ title, children, close }: { title: string; children: React.ReactNode; close: () => void }) { return <div className="modal-shade" onClick={close}><section role="dialog" aria-modal="true" aria-label={title} className="modal" onClick={e => e.stopPropagation()}><div className="card-head"><h2>{title}</h2><button className="icon-button" aria-label="关闭弹窗" onClick={close}><X size={20} /></button></div>{children}</section></div>; }
 function App() {
-  const [status, setStatus] = useState<Status | null>(null), [page, setPage] = useState<Page>('overview');
+  const [status, setStatus] = useState<Status | null>(null), [page, setPage] = useState<Page>(location.hash === '#analytics' ? 'analytics' : 'overview');
   const [voices, setVoices] = useState<Voice[]>([]), [logs, setLogs] = useState<LogEntry[]>([]);
   const [toast, setToast] = useState(''), [fatal, setFatal] = useState(''), [busy, setBusy] = useState('');
   const [playerState, setPlayerState] = useState<'waiting' | 'starting' | 'blocked' | 'playing' | 'other' | 'stopped' | 'error'>('waiting');
@@ -173,6 +175,7 @@ function App() {
         <section className="card connect-card"><div className="card-head"><h2>连接状态</h2><button className="icon-button" aria-label="打开接入设置" onClick={() => setPage('settings')}><SlidersHorizontal size={17} /></button></div><Connection ok={status.bridgeConnections > 0} title="LAPLACE 弹幕桥" detail={status.bridgeConnections ? `${status.bridgeConnections} 个事件源已接入` : '等待 Event Bridge 连接'} /><Connection ok={status.configured} title="豆包语音 2.0" detail={status.configured ? '凭据已保存 · 可开始试听' : '尚未配置 API 凭据'} /><Connection ok={playing} title="本地播放器" detail={playing ? '默认自动播放 · 正在接收播放任务' : playerTitle} /><div className="connect-foot"><LockKeyhole size={14} />服务仅监听本机 127.0.0.1</div></section></div>
         <div className="dashboard-grid lower"><section className="card"><div className="card-head"><h2>弹幕动态 <Badge>{logs.length ? '最近记录' : '等待中'}</Badge></h2><button className="text-button" onClick={() => setPage('logs')}>查看全部 <ArrowRight size={15} /></button></div>{logs.length ? <LogList logs={logs.slice(0, 5)} compact /> : <Empty title="第一条有声弹幕，等你开启">连接 LAPLACE 后，互动指令和播报记录会出现在这里。</Empty>}</section><section className="card command-card"><div className="card-head"><h2>把选择权交给观众</h2><Sparkles size={19} /></div><p>发送弹幕即可设置，下次来依然记得。</p><div className="command-row"><code>#音色 小何</code><span>换个声音</span></div><div className="command-row"><code>#风格 开心俏皮地说</code><span>赋予性格</span></div><div className="command-row"><code>#语速 1.2</code><span>调整节奏</span></div><div className="command-row"><code>#定制 温柔的成年女声</code><span>申请专属</span></div><button className="text-button" onClick={() => setHelp(true)}>查看全部指令 <ArrowRight size={15} /></button></section></div>
       </>}
+      {page === 'analytics' && <AnalyticsDashboard api={api} room={s.roomId} />}
       {page === 'events' && <EventSettings settings={s} save={saveSettings} />}
       {page === 'voices' && <Voices reloadVoices={reloadVoices} voices={voices} settings={s} busy={busy} preview={preview} save={saveSettings} />}
       {page === 'viewers' && <Viewers voices={voices} settings={s} notify={notify} action={action} />}
