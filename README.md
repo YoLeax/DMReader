@@ -8,6 +8,8 @@
 
 本机运行的哔哩哔哩弹幕 TTS 控制台。连接已登录的 LAPLACE Chat，用火山引擎豆包语音合成 2.0 播报。按真实 UID 保存观众的音色、风格、语速，重启和改名不丢失。
 
+**音色预览**：可先访问 [DMVoicePreview · 豆包音色预览](https://yoleax.github.io/DMVoicePreview/)，在网页上快捷试听豆包语音的各种音色。
+
 ## 启动
 
 环境：**Node.js 24 或更新版本**。本项目当前使用 Node 24 的内置 SQLite。
